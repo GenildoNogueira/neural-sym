@@ -1,0 +1,56 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ns-core",
+    "crates/ns-memory",
+    "crates/ns-llm",
+    "crates/ns-verifier",
+    "crates/ns-engine",
+    "crates/ns-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+
+[workspace.dependencies]
+ns-core = { path = "crates/ns-core" }
+ns-memory = { path = "crates/ns-memory" }
+ns-llm = { path = "crates/ns-llm" }
+ns-verifier = { path = "crates/ns-verifier" }
+ns-engine = { path = "crates/ns-engine" }
+
+# Dependências compartilhadas
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dashmap = "6"
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+schemars = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+redb = "5"
+safetensors = "0.4"
+tantivy = "0.22"
+llguidance = "1.9"
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+toktrie_hf_tokenizers = "1.9"
+rayon = "1.10"
+z3 = { version = "0.12", default-features = false }
+wasmtime = "51.0.0"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[profile.release]
+lto = "fat"
+codefen-units = 1
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+unwrap_used = "deny"

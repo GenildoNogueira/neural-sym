@@ -1,0 +1,30 @@
+[package]
+name = "ns-memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["redb", "tantivy-search"]
+redb = ["dep:redb"]
+tantivy-search = ["redb", "dep:tantivy"]
+
+[dependencies]
+dashmap.workspace = true
+ns-core.workspace = true
+redb = { workspace = true, optional = true }
+tantivy = { workspace = true, optional = true }
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "storage_comparison"
+harness = false
+required-features = ["redb"]

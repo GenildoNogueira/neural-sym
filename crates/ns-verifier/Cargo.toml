@@ -1,0 +1,23 @@
+[package]
+name = "ns-verifier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+z3-solver = ["dep:z3"]
+z3-static = ["z3-solver", "z3/static-link-z3"]
+wasm-sandbox = ["dep:wasmtime"]
+
+[dependencies]
+ns-core.workspace = true
+rust_decimal.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+wasmtime = { workspace = true, optional = true }
+z3 = { workspace = true, optional = true }
+
+[lints]
+workspace = true

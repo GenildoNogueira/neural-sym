@@ -1,0 +1,43 @@
+[package]
+name = "ns-llm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+mock = []
+custom-rwkv = [
+    "dep:llguidance",
+    "dep:rayon",
+    "dep:safetensors",
+    "dep:serde",
+    "dep:tokenizers",
+    "dep:toktrie_hf_tokenizers",
+]
+local-gpu = [
+    "dep:llguidance",
+    "dep:tokio",
+]
+
+[dependencies]
+llguidance = { workspace = true, optional = true }
+ns-core.workspace = true
+rayon = { workspace = true, optional = true }
+safetensors = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json.workspace = true
+thiserror.workspace = true
+tokenizers = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+toktrie_hf_tokenizers = { workspace = true, optional = true }
+tracing.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "rwkv_speed"
+harness = false
+required-features = ["custom-rwkv"]

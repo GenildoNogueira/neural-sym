@@ -1,0 +1,38 @@
+[package]
+name = "ns-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["tantivy-search", "custom-rwkv"]
+tantivy-search = ["ns-memory/tantivy-search"]
+custom-rwkv = ["ns-llm/custom-rwkv"]
+z3-solver = ["ns-verifier/z3-solver"]
+z3-static = ["ns-verifier/z3-static"]
+wasm-sandbox = ["ns-verifier/wasm-sandbox"]
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+ns-core.workspace = true
+ns-engine.workspace = true
+ns-llm = { workspace = true, features = ["mock"] }
+ns-memory = { workspace = true, features = ["redb"] }
+ns-verifier.workspace = true
+rust_decimal.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+safetensors.workspace = true
+
+[lints]
+workspace = true
+
+[[example]]
+name = "eval_json_vs_isa"
+required-features = ["custom-rwkv", "tantivy-search"]
