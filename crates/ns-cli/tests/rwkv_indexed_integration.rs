@@ -91,6 +91,9 @@ fn write_dummy_rwkv7_dir(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         isa_ptr_dim: 0,
         isa_num_vocab: 64,
         copy_max_len: 64,
+        moe_num_experts: 0,
+        moe_top_k: 2,
+        moe_neuron_top_k: 0,
     };
 
     std::fs::write(dir.join("config.json"), serde_json::to_string_pretty(&cfg)?)?;
