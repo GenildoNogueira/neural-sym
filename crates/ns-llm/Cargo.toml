@@ -41,3 +41,7 @@ workspace = true
 name = "rwkv_speed"
 harness = false
 required-features = ["custom-rwkv"]
+
+[[example]]
+name = "moe_constant_latency"
+required-features = ["custom-rwkv"]
