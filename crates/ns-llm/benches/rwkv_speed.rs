@@ -203,6 +203,9 @@ fn build_synthetic_rwkv7_model(copy_dim: usize) -> Result<Rwkv7Llm, Box<dyn std:
         isa_ptr_dim: 0,
         isa_num_vocab: 64,
         copy_max_len: BENCH_COPY_MAX_LEN,
+        moe_num_experts: 0,
+        moe_top_k: 2,
+        moe_neuron_top_k: 0,
     };
 
     let vocab_bin = build_synthetic_vocab_bin(cfg.vocab_size);
