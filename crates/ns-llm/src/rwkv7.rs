@@ -733,10 +733,27 @@ impl Rwkv7TimeMixingWeights {
 }
 
 #[derive(Debug, Clone)]
+enum ChannelMixingFfn {
+    Dense {
+        key: QuantizedMatrix,
+        value: SparseColQuantizedMatrix,
+    },
+    SparseMoe(SparseMoeFfn),
+}
+
+#[derive(Debug, Clone)]
 struct Rwkv7ChannelMixingWeights {
     x_k: Box<[f32]>,
-    key: QuantizedMatrix,
-    value: SparseColQuantizedMatrix,
+    ffn: ChannelMixingFfn,
+}
+
+impl Rwkv7ChannelMixingWeights {
+    const fn weight_bytes(&self) -> usize {
+        match &self.ffn {
+            ChannelMixingFfn::Dense { key, value } => key.weight_bytes() + value.weight_bytes(),
+            ChannelMixingFfn::SparseMoe(moe) => moe.weight_bytes(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -749,7 +766,7 @@ struct Rwkv7BlockWeights {
 
 impl Rwkv7BlockWeights {
     fn weight_bytes(&self) -> usize {
-        self.tm.weight_bytes() + self.cm.key.weight_bytes() + self.cm.value.weight_bytes()
+        self.tm.weight_bytes() + self.cm.weight_bytes()
     }
 }
 
@@ -842,6 +859,7 @@ struct Rwkv7Scratch {
     copy_attn: Vec<f32>,
     vocab_scores: Vec<f32>,
     copy_vocab_acc: Box<[f32]>,
+    moe: Option<SparseMoeScratch>,
 }
 
 impl Rwkv7Scratch {
@@ -859,6 +877,12 @@ impl Rwkv7Scratch {
         let copy_dim = cfg.copy_dim;
         let copy_cap = if copy_dim > 0 { cfg.copy_max_len } else { 0 };
         let copy_acc_len = if copy_dim > 0 { cfg.vocab_size } else { 0 };
+
+        if cfg.moe_num_experts > 0 {
+            Some(SparseMoeScratch::new(cfg.moe_num_experts, cfg.ffn_dim))
+        } else {
+            None
+        }
 
         Self {
             x_emb: vec![0.0; d].into_boxed_slice(),
@@ -1150,20 +1174,35 @@ impl Rwkv7Llm {
             };
 
             let ln2 = read_ln(&st, &format!("{bp}.ln2"), d)?;
+            let ffn_backend = if cfg.moe_num_experts > 0 {
+                ChannelMixingFfn::SparseMoe(SparseMoeFfn::load_from_safetensors(
+                    &st,
+                    &format!("{bp}.cm"),
+                    d,
+                    ffn,
+                    cfg.moe_num_experts,
+                    cfg.moe_top_k,
+                    cfg.moe_neuron_top_k,
+                )?)
+            } else {
+                ChannelMixingFfn::Dense {
+                    key: QuantizedMatrix::load_from_safetensors(
+                        &st,
+                        &format!("{bp}.cm.key.weight"),
+                        ffn,
+                        d,
+                    )?,
+                    value: SparseColQuantizedMatrix::load_from_safetensors(
+                        &st,
+                        &format!("{bp}.cm.value.weight"),
+                        d,
+                        ffn,
+                    )?,
+                }
+            };
             let cm = Rwkv7ChannelMixingWeights {
                 x_k: read_f32_boxed(&st, &format!("{bp}.cm.x_k"), &[d])?,
-                key: QuantizedMatrix::load_from_safetensors(
-                    &st,
-                    &format!("{bp}.cm.key.weight"),
-                    ffn,
-                    d,
-                )?,
-                value: SparseColQuantizedMatrix::load_from_safetensors(
-                    &st,
-                    &format!("{bp}.cm.value.weight"),
-                    d,
-                    ffn,
-                )?,
+                ffn: ffn_backend,
             };
 
             blocks.push(Rwkv7BlockWeights { ln1, tm, ln2, cm });
@@ -1451,13 +1490,43 @@ impl Rwkv7Llm {
             }
             layer_state.prev_x_cm.copy_from_slice(&scratch.x_ln);
 
-            block
-                .cm
-                .key
-                .matvec_into(&scratch.x_shift, &mut scratch.q_input, &mut scratch.cm_k);
-            for val in scratch.cm_k.iter_mut() {
-                let r = val.max(0.0);
-                *val = r * r;
+            match &block.cm.ffn {
+                ChannelMixingFfn::Dense { key, value } => {
+                    key.matvec_into(&scratch.x_shift, &mut scratch.q_input, &mut scratch.cm_k);
+                    for val in scratch.cm_k.iter_mut() {
+                        let r = val.max(0.0);
+                        *val = r * r;
+                    }
+                    let active = value.accumulate_sparse(&scratch.cm_k, &mut scratch.x);
+                    let total_bytes = key.weight_bytes() + value.weight_bytes();
+                    let read_bytes = key.weight_bytes() + active * value.col_stride_bytes();
+                    state.total_ffn_cols =
+                        state.total_ffn_cols.saturating_add(self.cfg.ffn_dim as u64);
+                    state.active_ffn_cols = state.active_ffn_cols.saturating_add(active as u64);
+                    state.total_ffn_bytes =
+                        state.total_ffn_bytes.saturating_add(total_bytes as u64);
+                    state.read_ffn_bytes =
+                        state.read_ffn_bytes.saturating_add(read_bytes as u64);
+                }
+                ChannelMixingFfn::SparseMoe(moe) => {
+                    if let Some(ref mut moe_sc) = scratch.moe {
+                        let stats = moe.forward_into(
+                            &scratch.x_shift,
+                            &mut scratch.q_input,
+                            moe_sc,
+                            &mut scratch.x,
+                        );
+                        state.total_ffn_cols =
+                            state.total_ffn_cols.saturating_add(stats.cols_total as u64);
+                        state.active_ffn_cols =
+                            state.active_ffn_cols.saturating_add(stats.cols_active as u64);
+                        state.total_ffn_bytes = state
+                            .total_ffn_bytes
+                            .saturating_add(stats.total_weight_bytes as u64);
+                        state.read_ffn_bytes =
+                            state.read_ffn_bytes.saturating_add(stats.bytes_read as u64);
+                    }
+                }
             }
 
             let active = block
