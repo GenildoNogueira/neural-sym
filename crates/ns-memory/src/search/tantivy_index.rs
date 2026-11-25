@@ -6,15 +6,18 @@ use ns_core::error::MemoryPortError;
 use ns_core::fact::{Fact, FactId};
 use ns_core::ports::DeterministicMemory;
 use tantivy::collector::TopDocs;
-use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, RegexQuery};
-use tantivy::schema::{Field, STORED, STRING, Schema, TEXT, Value};
-use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term, doc};
+use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, RegexQuery, TermQuery};
+use tantivy::schema::{Field, IndexRecordOption, STORED, STRING, Schema, TEXT, Value};
+use tantivy::{
+    Index, IndexReader, IndexWriter, ReloadPolicy, Searcher, TantivyDocument, Term, doc,
+};
 
 use crate::error::MemoryError;
 use crate::facts::{MAX_SEARCH_LIMIT, normalize_key};
 use crate::store::RedbMemory;
 
 const WRITER_HEAP_BYTES: usize = 15_000_000;
+const MAX_FST_FALLBACK_TERMS: usize = 6;
 
 #[derive(Debug, Clone, Copy)]
 struct FactFields {
@@ -118,9 +121,15 @@ impl TantivyFactIndex {
         let mut writer = self.writer.lock().map_err(|_| MemoryError::LockPoisoned)?;
 
         if let Some(old_id) = replaced_id {
-            writer.delete_term(Term::from_field_text(self.fields.id, old_id.as_str()));
+            writer.delete_term(Term::from_field_text(
+                self.fields.id,
+                old_id.as_str().trim(),
+            ));
         }
-        writer.delete_term(Term::from_field_text(self.fields.id, fact.id.as_str()));
+        writer.delete_term(Term::from_field_text(
+            self.fields.id,
+            fact.id.as_str().trim(),
+        ));
         writer.add_document(self.to_document(fact))?;
         writer.commit()?;
         drop(writer);
@@ -129,7 +138,7 @@ impl TantivyFactIndex {
         Ok(())
     }
 
-    /// Indexa um lote inteiro em um único commit no Tantivy.
+    /// Indexa um lote inteiro em um único commit no Tantivy, removendo quaisquer `replaced_ids`.
     ///
     /// # Errors
     ///
@@ -137,12 +146,20 @@ impl TantivyFactIndex {
     pub fn upsert_batch(&self, facts: &[Fact], replaced_ids: &[FactId]) -> Result<(), MemoryError> {
         let mut writer = self.writer.lock().map_err(|_| MemoryError::LockPoisoned)?;
 
+        let replaced_set: HashSet<&str> =
+            replaced_ids.iter().map(|id| id.as_str().trim()).collect();
         for old_id in replaced_ids {
-            writer.delete_term(Term::from_field_text(self.fields.id, old_id.as_str()));
+            writer.delete_term(Term::from_field_text(
+                self.fields.id,
+                old_id.as_str().trim(),
+            ));
         }
         for fact in facts {
-            writer.delete_term(Term::from_field_text(self.fields.id, fact.id.as_str()));
-            writer.add_document(self.to_document(fact))?;
+            let id_str = fact.id.as_str().trim();
+            writer.delete_term(Term::from_field_text(self.fields.id, id_str));
+            if !replaced_set.contains(id_str) {
+                writer.add_document(self.to_document(fact))?;
+            }
         }
         writer.commit()?;
         drop(writer);
@@ -169,9 +186,12 @@ impl TantivyFactIndex {
         Ok(facts.len())
     }
 
-    /// Retorna até `limit` `FactId`s ranqueados por BM25, usando busca literal direta na FST
-    /// quando o termo contém símbolos (ex.: `"plano_"` ou `"15%"`) para evitar que o
-    /// `SimpleTokenizer` descarte a pontuação e gere falsos positivos.
+    /// Retorna até `limit` `FactId`s ranqueados por BM25 + boost exato em `*_raw`.
+    ///
+    /// - Consultas de termo único contendo símbolos (ex.: `"plano_"` ou `"15%"`) vão direto na FST
+    ///   para evitar falsos positivos causados pela remoção de pontuação do `SimpleTokenizer`.
+    /// - Perguntas em linguagem natural (ex.: `"Qual o(a) preco_mensal de plano_enterprise?"`)
+    ///   são sanitizadas contra operadores de sintaxe e stopwords antes da busca BM25.
     ///
     /// # Errors
     ///
@@ -194,8 +214,53 @@ impl TantivyFactIndex {
             .any(|c| !c.is_alphanumeric() && !c.is_whitespace());
         let literal_symbol_query = !has_whitespace && has_symbol;
 
-        // 1. Fast-path BM25 nos campos tokenizados (consultas em linguagem natural)
+        // 1. Fast-path BM25 + boost exato nos campos *_raw (linguagem natural e termos limpos)
         if !literal_symbol_query {
+            let terms = extract_query_terms(&needle);
+            if !terms.is_empty() {
+                self.search_bm25_and_raw(&searcher, &terms, cap, &mut seen, &mut ids)?;
+            }
+        }
+
+        // 2. FST literal: obrigatória para símbolos isolados; fallback para substrings/prefixos
+        if literal_symbol_query || (!has_whitespace && ids.len() < cap) {
+            self.search_fst_terms(&searcher, &[needle.as_str()], cap, &mut seen, &mut ids)?;
+        } else if has_whitespace && ids.is_empty() {
+            let mut fallback_terms: Vec<String> = extract_query_terms(&needle)
+                .into_iter()
+                .filter(|t| t.chars().count() >= 3)
+                .collect();
+            fallback_terms.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+            fallback_terms.truncate(MAX_FST_FALLBACK_TERMS);
+
+            let refs: Vec<&str> = fallback_terms.iter().map(String::as_str).collect();
+            if !refs.is_empty() {
+                self.search_fst_terms(&searcher, &refs, cap, &mut seen, &mut ids)?;
+            }
+        }
+
+        Ok(ids)
+    }
+
+    fn search_bm25_and_raw(
+        &self,
+        searcher: &Searcher,
+        terms: &[String],
+        cap: usize,
+        seen: &mut HashSet<FactId>,
+        ids: &mut Vec<FactId>,
+    ) -> Result<(), MemoryError> {
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(terms.len() * 3 + 1);
+
+        // Separa '_' e '-' em subtokens limpos para casar tanto "plano_enterprise" quanto "plano enterprise"
+        let bm25_text = terms
+            .iter()
+            .flat_map(|t| t.split(['_', '-']))
+            .filter(|sub| !sub.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        if !bm25_text.is_empty() {
             let parser = QueryParser::for_index(
                 &self.index,
                 vec![
@@ -204,25 +269,46 @@ impl TantivyFactIndex {
                     self.fields.object_text,
                 ],
             );
-            let (bm25_query, _parse_errors) = parser.parse_query_lenient(&needle);
-            let bm25_hits = searcher.search(&bm25_query, &TopDocs::with_limit(cap))?;
+            let (bm25_query, _parse_errors) = parser.parse_query_lenient(&bm25_text);
+            clauses.push((Occur::Should, bm25_query));
+        }
 
-            for (_score, addr) in bm25_hits {
-                let doc: TantivyDocument = searcher.doc(addr)?;
-                if let Some(raw_id) = doc.get_first(self.fields.id).and_then(|v| v.as_str()) {
-                    let fact_id = FactId::new(raw_id);
-                    if seen.insert(fact_id.clone()) {
-                        ids.push(fact_id);
-                    }
-                }
+        // Boost O(1) para identificadores exatos em *_raw (ex.: "plano_enterprise", "preco_mensal")
+        for tok in terms {
+            for field in [
+                self.fields.subject_raw,
+                self.fields.relation_raw,
+                self.fields.object_raw,
+            ] {
+                let term = Term::from_field_text(field, tok);
+                clauses.push((
+                    Occur::Should,
+                    Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+                ));
             }
         }
 
-        // 2. Busca literal na FST para substrings exatas (obrigatória para símbolos; fallback para demais)
-        if ids.len() < cap {
-            let pattern = format!(".*{}.*", escape_regex(&needle));
-            let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(3);
+        if clauses.is_empty() {
+            return Ok(());
+        }
 
+        let combined = BooleanQuery::new(clauses);
+        let hits = searcher.search(&combined, &TopDocs::with_limit(cap))?;
+        self.collect_hit_ids(searcher, hits, cap, seen, ids)
+    }
+
+    fn search_fst_terms(
+        &self,
+        searcher: &Searcher,
+        terms: &[&str],
+        cap: usize,
+        seen: &mut HashSet<FactId>,
+        ids: &mut Vec<FactId>,
+    ) -> Result<(), MemoryError> {
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(terms.len() * 3);
+
+        for &term in terms {
+            let pattern = format!(".*{}.*", escape_regex(term));
             for field in [
                 self.fields.subject_raw,
                 self.fields.relation_raw,
@@ -232,35 +318,48 @@ impl TantivyFactIndex {
                     clauses.push((Occur::Should, Box::new(regex_query)));
                 }
             }
+        }
 
-            if !clauses.is_empty() {
-                let union = BooleanQuery::new(clauses);
-                let fst_hits = searcher.search(&union, &TopDocs::with_limit(cap))?;
-                for (_score, addr) in fst_hits {
-                    if ids.len() >= cap {
-                        break;
-                    }
-                    let doc: TantivyDocument = searcher.doc(addr)?;
-                    if let Some(raw_id) = doc.get_first(self.fields.id).and_then(|v| v.as_str()) {
-                        let fact_id = FactId::new(raw_id);
-                        if seen.insert(fact_id.clone()) {
-                            ids.push(fact_id);
-                        }
-                    }
+        if clauses.is_empty() {
+            return Ok(());
+        }
+
+        let union = BooleanQuery::new(clauses);
+        let hits = searcher.search(&union, &TopDocs::with_limit(cap))?;
+        self.collect_hit_ids(searcher, hits, cap, seen, ids)
+    }
+
+    fn collect_hit_ids(
+        &self,
+        searcher: &Searcher,
+        hits: Vec<(f32, tantivy::DocAddress)>,
+        cap: usize,
+        seen: &mut HashSet<FactId>,
+        ids: &mut Vec<FactId>,
+    ) -> Result<(), MemoryError> {
+        for (_score, addr) in hits {
+            if ids.len() >= cap {
+                break;
+            }
+            let doc: TantivyDocument = searcher.doc(addr)?;
+            if let Some(raw_id) = doc.get_first(self.fields.id).and_then(|v| v.as_str()) {
+                let fact_id = FactId::new(raw_id);
+                if seen.insert(fact_id.clone()) {
+                    ids.push(fact_id);
                 }
             }
         }
-
-        Ok(ids)
+        Ok(())
     }
 
     fn to_document(&self, fact: &Fact) -> TantivyDocument {
+        let id_norm = fact.id.as_str().trim();
         let subject_norm = normalize_key(&fact.subject);
         let relation_norm = normalize_key(&fact.relation);
         let object_norm = normalize_key(&fact.object);
 
         doc!(
-            self.fields.id => fact.id.as_str(),
+            self.fields.id => id_norm,
             self.fields.subject_text => subject_norm.as_str(),
             self.fields.relation_text => relation_norm.as_str(),
             self.fields.object_text => object_norm.as_str(),
@@ -304,30 +403,29 @@ impl IndexedRedbMemory {
         Ok(Self { store, index })
     }
 
-    /// Grava primeiro no `redb` (fonte da verdade) e atualiza o índice Tantivy em seguida.
+    /// Grava primeiro no `redb` (fonte da verdade) e sincroniza o índice Tantivy removendo
+    /// eventual `FactId` antigo substituído no mesmo par `(subject, relation)`.
     ///
     /// # Errors
     ///
     /// Retorna [`MemoryError`] se a gravação ou indexação falhar.
     pub fn upsert_fact(&self, fact: &Fact) -> Result<Fact, MemoryError> {
-        let previous_id = self
-            .store
-            .lookup_by_id(&fact.id)?
-            .map(|existing| existing.id);
-        let stored = self.store.upsert_fact(fact)?;
-        self.index.upsert_fact(&stored, previous_id.as_ref())?;
+        let (stored, replaced_id) = self.store.upsert_fact_with_replaced(fact)?;
+        self.index.upsert_fact(&stored, replaced_id.as_ref())?;
         Ok(stored)
     }
 
-    /// Grava um lote inteiro em uma única transação `redb` e um único commit Tantivy.
+    /// Grava um lote inteiro em uma única transação `redb` e um único commit Tantivy,
+    /// removendo do índice todos os `FactId`s substituídos pelo lote.
     ///
     /// # Errors
     ///
     /// Retorna [`MemoryError`] se a gravação em lote ou indexação falhar.
     pub fn upsert_batch(&self, facts: &[Fact]) -> Result<usize, MemoryError> {
-        let count = self.store.upsert_batch(facts)?;
-        self.index.upsert_batch(facts, &[])?;
-        Ok(count)
+        let report = self.store.upsert_batch_with_replaced(facts)?;
+        self.index
+            .upsert_batch(&report.surviving, &report.replaced_ids)?;
+        Ok(report.count)
     }
 
     /// Reconstrói completamente o índice Tantivy a partir do conteúdo autoritativo do `redb`.
@@ -370,14 +468,7 @@ impl DeterministicMemory for IndexedRedbMemory {
 
     async fn search_facts(&self, query: &str, limit: u8) -> Result<Vec<Fact>, MemoryPortError> {
         let candidate_ids = self.index.search_ids(query, limit)?;
-        let mut resolved = Vec::with_capacity(candidate_ids.len());
-
-        for id in &candidate_ids {
-            if let Some(fact) = self.store.lookup_by_id(id)? {
-                resolved.push(fact);
-            }
-        }
-
+        let resolved = self.store.lookup_many_by_ids(&candidate_ids)?;
         Ok(resolved)
     }
 
@@ -392,6 +483,77 @@ impl DeterministicMemory for IndexedRedbMemory {
     async fn verify_fact_exists(&self, id: &FactId) -> Result<bool, MemoryPortError> {
         self.store.verify_fact_exists(id).await
     }
+}
+
+fn extract_query_terms(needle: &str) -> Vec<String> {
+    let mut all_tokens: Vec<String> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+
+    for raw in needle.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-') {
+        let tok = raw.trim_matches(['_', '-']);
+        if tok.is_empty() || !seen.insert(tok) {
+            continue;
+        }
+        all_tokens.push(tok.to_owned());
+    }
+
+    let filtered: Vec<String> = all_tokens
+        .iter()
+        .filter(|tok| tok.chars().count() >= 2 && !is_stopword(tok))
+        .cloned()
+        .collect();
+
+    if filtered.is_empty() {
+        all_tokens
+    } else {
+        filtered
+    }
+}
+
+fn is_stopword(token: &str) -> bool {
+    matches!(
+        token,
+        "de" | "do"
+            | "da"
+            | "dos"
+            | "das"
+            | "em"
+            | "no"
+            | "na"
+            | "nos"
+            | "nas"
+            | "um"
+            | "uma"
+            | "uns"
+            | "umas"
+            | "os"
+            | "as"
+            | "ao"
+            | "aos"
+            | "ou"
+            | "se"
+            | "qual"
+            | "quais"
+            | "que"
+            | "quem"
+            | "onde"
+            | "quando"
+            | "como"
+            | "para"
+            | "por"
+            | "pelo"
+            | "pela"
+            | "com"
+            | "sem"
+            | "the"
+            | "of"
+            | "in"
+            | "to"
+            | "for"
+            | "is"
+            | "are"
+            | "what"
+    )
 }
 
 fn escape_regex(input: &str) -> String {
@@ -458,6 +620,81 @@ mod tests {
         let exact = mem.lookup_fact("plano_pro", "preco_mensal").await?;
         assert_eq!(exact.as_ref().map(|f| f.object.as_str()), Some("199.90"));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn natural_language_shortlist_query_ranks_target_fact_first()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mem = IndexedRedbMemory::open_in_memory()?;
+        mem.upsert_batch(&[
+            Fact {
+                id: FactId::from("fact-preco-001"),
+                subject: "plano_001".to_owned(),
+                relation: "preco_mensal".to_owned(),
+                object: "49.00".to_owned(),
+                source_ref: "test".to_owned(),
+            },
+            Fact {
+                id: FactId::from("fact-inedito-9842"),
+                subject: "plano_enterprise".to_owned(),
+                relation: "preco_mensal".to_owned(),
+                object: "749.50".to_owned(),
+                source_ref: "test".to_owned(),
+            },
+        ])?;
+
+        let hits = mem
+            .search_facts("Qual o(a) preco_mensal de plano_enterprise?", 12)
+            .await?;
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].id, FactId::from("fact-inedito-9842"));
+
+        // Substring parcial dentro de pergunta natural também cai no fallback FST por token
+        let partial = mem.search_facts("Qual o plano enterpr?", 5).await?;
+        assert!(
+            partial
+                .iter()
+                .any(|f| f.id == FactId::from("fact-inedito-9842"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replacing_fact_id_removes_stale_entry_from_tantivy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mem = IndexedRedbMemory::open_in_memory()?;
+        mem.upsert_fact(&Fact {
+            id: FactId::from("fact-old"),
+            subject: "plano_enterprise".to_owned(),
+            relation: "preco_mensal".to_owned(),
+            object: "500.00".to_owned(),
+            source_ref: "v1".to_owned(),
+        })?;
+
+        // Atualiza o mesmo par (subject, relation) com novo FactId
+        mem.upsert_fact(&Fact {
+            id: FactId::from("fact-new"),
+            subject: "plano_enterprise".to_owned(),
+            relation: "preco_mensal".to_owned(),
+            object: "749.50".to_owned(),
+            source_ref: "v2".to_owned(),
+        })?;
+
+        let indexed_ids = mem.index.search_ids("plano_enterprise", 10)?;
+        assert_eq!(indexed_ids, vec![FactId::from("fact-new")]);
+
+        // Também limpa IDs antigos quando a substituição acontece via upsert_batch
+        mem.upsert_batch(&[Fact {
+            id: FactId::from("fact-v3"),
+            subject: "plano_enterprise".to_owned(),
+            relation: "preco_mensal".to_owned(),
+            object: "899.00".to_owned(),
+            source_ref: "v3".to_owned(),
+        }])?;
+
+        let indexed_after_batch = mem.index.search_ids("plano_enterprise", 10)?;
+        assert_eq!(indexed_after_batch, vec![FactId::from("fact-v3")]);
         Ok(())
     }
 }
