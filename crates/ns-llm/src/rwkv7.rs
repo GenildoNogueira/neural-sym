@@ -577,6 +577,64 @@ impl SparseColQuantizedMatrix {
     /// Acumula `out += W * act` lendo da RAM **apenas** colunas com `act[col] > 0.0`.
     /// Retorna quantas colunas ativas foram lidas.
     pub fn accumulate_sparse(&self, act: &[f32], out: &mut [f32]) -> usize {
+        self.accumulate_sparse_scaled(act, 1.0, out)
+    }
+
+    /// Acumula `out += (scale * W) * act` fundindo o peso do roteador MoE no fator de coluna,
+    /// sem tocar na RAM para colunas zeradas (`act[col] <= 0.0`).
+    pub fn accumulate_sparse_scaled(&self, act: &[f32], scale: f32, out: &mut [f32]) -> usize {
+        debug_assert_eq!(act.len(), self.in_dim);
+        debug_assert_eq!(out.len(), self.out_dim);
+
+        if scale == 0.0 || !scale.is_finite() {
+            return 0;
+        }
+
+        let mut active_cols: usize = 0;
+        let out_dim = self.out_dim;
+
+        for (col, &a) in act.iter().enumerate() {
+            if a <= 0.0 {
+                continue;
+            }
+            let factor = a * scale * self.col_scales[col];
+            if factor == 0.0 {
+                continue;
+            }
+            active_cols += 1;
+            let col_slice = &self.cols_q[col * out_dim..(col + 1) * out_dim];
+            for (dst, &q) in out.iter_mut().zip(col_slice.iter()) {
+                *dst += f32::from(q) * factor;
+            }
+        }
+
+        active_cols
+    }
+
+    #[must_use]
+    pub const fn in_dim(&self) -> usize {
+        self.in_dim
+    }
+
+    #[must_use]
+    pub const fn out_dim(&self) -> usize {
+        self.out_dim
+    }
+
+    /// Bytes físicos lidos da RAM por coluna ativa (`out_dim` bytes W8 + 1 escala `f32`).
+    #[must_use]
+    pub const fn col_stride_bytes(&self) -> usize {
+        self.out_dim + std::mem::size_of::<f32>()
+    }
+
+    #[must_use]
+    pub const fn weight_bytes(&self) -> usize {
+        self.cols_q.len() + self.col_scales.len() * std::mem::size_of::<f32>()
+    }
+
+    /// Acumula `out += W * act` lendo da RAM **apenas** colunas com `act[col] > 0.0`.
+    /// Retorna quantas colunas ativas foram lidas.
+    pub fn accumulate_sparse(&self, act: &[f32], out: &mut [f32]) -> usize {
         debug_assert_eq!(act.len(), self.in_dim);
         debug_assert_eq!(out.len(), self.out_dim);
 
