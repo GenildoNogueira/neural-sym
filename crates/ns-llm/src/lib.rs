@@ -3,6 +3,7 @@ pub mod grammar;
 pub mod isa;
 pub mod isa_adapter;
 pub mod isa_bank;
+pub mod sparse_moe;
 
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
@@ -28,3 +29,4 @@ pub use chat::{ChatSamplingConfig, ChatTurnStats};
 pub use rwkv7::{
     Rwkv7ChatSession, Rwkv7Config, Rwkv7Llm, Rwkv7State, SparseColQuantizedMatrix, load_vocab_trie,
 };
+pub use sparse_moe::{MoeStepStats, SparseExpert, SparseMoeFfn, SparseMoeScratch};
