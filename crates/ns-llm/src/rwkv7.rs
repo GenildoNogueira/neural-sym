@@ -61,6 +61,10 @@ const fn default_isa_num_vocab() -> usize {
     64
 }
 
+const fn default_moe_top_k() -> usize {
+    2
+}
+
 /// Modo de decodificação usado por [`Rwkv7Llm`] em [`ConstrainedLlm::next_action`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DecodeMode {
@@ -104,6 +108,15 @@ pub struct Rwkv7Config {
     /// Quantidade de inteiros `0..isa_num_vocab` representados em 1 passo na cabeça numérica da ISA.
     #[serde(default = "default_isa_num_vocab")]
     pub isa_num_vocab: usize,
+    /// `0` mantém FFN densa tradicional; `> 0` ativa `SparseMoeFfn` com N especialistas por camada.
+    #[serde(default)]
+    pub moe_num_experts: usize,
+    /// Quantidade de especialistas ativos por token quando `moe_num_experts > 0`.
+    #[serde(default = "default_moe_top_k")]
+    pub moe_top_k: usize,
+    /// Teto rígido de colunas ativas por especialista (`0` = apenas esparsidade natural `ReLU²`).
+    #[serde(default)]
+    pub moe_neuron_top_k: usize,
 }
 
 /// Sessão de conversa contínua para o RWKV-v7 mantendo o estado matricial O(1) vivo entre turnos.
@@ -2455,6 +2468,9 @@ mod tests {
             isa_ptr_dim: 0,
             isa_num_vocab: 64,
             copy_max_len: 64,
+            moe_num_experts: 0,
+            moe_top_k: 2,
+            moe_neuron_top_k: 0,
         };
 
         let mut bufs: Vec<(String, Vec<usize>, Dtype, Vec<u8>)> = Vec::new();
