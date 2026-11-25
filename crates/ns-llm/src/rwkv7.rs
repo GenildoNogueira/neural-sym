@@ -1643,12 +1643,12 @@ impl Rwkv7Llm {
                 *dst += weight * kv;
             }
             let tok = scratch.copy_tokens[slot];
-            if mask.is_allowed(tok) {
-                if let Ok(idx) = usize::try_from(tok) {
-                    if let Some(acc) = scratch.copy_vocab_acc.get_mut(idx) {
-                        *acc += weight;
-                        any_allowed_copy = true;
-                    }
+            if mask.is_allowed(tok)
+                && let Ok(idx) = usize::try_from(tok)
+            {
+                if let Some(acc) = scratch.copy_vocab_acc.get_mut(idx) {
+                    *acc += weight;
+                    any_allowed_copy = true;
                 }
             }
         }
@@ -1739,10 +1739,10 @@ impl Rwkv7Llm {
 
         // Regra oficial do RWKV-7 G1: sempre começar com o token 0 (EOS/BOS) para ancorar o estado
         self.forward_hidden(self.cfg.bos_token_id, &mut state)?;
-        if record_from == 0 {
-            if let Some(&first_tok) = prompt_ids.first() {
-                self.record_copy_entry(&mut state, first_tok);
-            }
+        if record_from == 0
+            && let Some(&first_tok) = prompt_ids.first()
+        {
+            self.record_copy_entry(&mut state, first_tok);
         }
 
         for (idx, &tok_id) in prompt_ids.iter().enumerate() {

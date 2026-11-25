@@ -43,5 +43,16 @@ harness = false
 required-features = ["custom-rwkv"]
 
 [[example]]
+name = "isa_measure"
+
+[[example]]
+name = "isa_compression"
+required-features = ["custom-rwkv"]
+
+[[example]]
 name = "moe_constant_latency"
+required-features = ["custom-rwkv"]
+
+[[example]]
+name = "q4_vs_w8_bench"
 required-features = ["custom-rwkv"]

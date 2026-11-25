@@ -19,8 +19,6 @@ const PARALLEL_MATVEC_MIN_MACS: usize = 512 * 1024;
 /// Linhas por tarefa do Rayon: agrupar reduz o overhead de agendamento por linha.
 const PARALLEL_ROW_CHUNK: usize = 64;
 const PARALLEL_SPARSE_THRESHOLD: usize = 1_024;
-/// Acima de 2 MiB, usa `PREFETCHNTA` em AVX2 para não expulsar `Rwkv7State` da L3.
-const NTA_PREFETCH_MIN_BYTES: usize = 2 * 1024 * 1024;
 
 /// Formato de quantização dos pesos lineares em RAM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -45,7 +43,7 @@ impl QuantFormat {
 
 /// Bloco compacto de 32 pesos 4-bit (`[-8, +7]` armazenados com offset `+8` em `[0, 15]`).
 ///
-/// Layout *split-half* compatível com descompactação em 1 registrador YMM:
+/// Layout *split-half* amigável à auto-vetorização:
 /// - nibble baixo de `qs[j]` = peso `j` (`0..16`)
 /// - nibble alto  de `qs[j]` = peso `j + 16` (`16..32`)
 #[derive(Debug, Clone, Copy)]
@@ -157,9 +155,9 @@ impl QuantizedMatrix {
                 }
                 QuantFormat::Q4 => {
                     let blocks_per_row = in_dim.div_ceil(Q4_BLOCK_SIZE);
-                    let total_blocks = out_dim
-                        .checked_mul(blocks_per_row)
-                        .ok_or_else(|| LlmError::ModelLoad(format!("shape overflow for '{name}'")))?;
+                    let total_blocks = out_dim.checked_mul(blocks_per_row).ok_or_else(|| {
+                        LlmError::ModelLoad(format!("shape overflow for '{name}'"))
+                    })?;
                     let mut blocks = Vec::with_capacity(total_blocks);
                     let q_bytes = q_view.data();
                     let mut row_f32 = vec![0.0_f32; in_dim];
@@ -327,9 +325,8 @@ impl QuantizedMatrix {
                 let in_dim = self.in_dim;
 
                 if self.out_dim.saturating_mul(in_dim) >= PARALLEL_MATVEC_MIN_MACS {
-                    out.par_chunks_mut(PARALLEL_ROW_CHUNK)
-                        .enumerate()
-                        .for_each(|(chunk_idx, chunk)| {
+                    out.par_chunks_mut(PARALLEL_ROW_CHUNK).enumerate().for_each(
+                        |(chunk_idx, chunk)| {
                             let row0 = chunk_idx * PARALLEL_ROW_CHUNK;
                             for (i, dst) in chunk.iter_mut().enumerate() {
                                 let row = row0 + i;
@@ -337,7 +334,8 @@ impl QuantizedMatrix {
                                 let acc = dot_i8_unrolled(&data[start..start + in_dim], qx_ref);
                                 *dst = (acc as f32) * (scales[row] * scale_x);
                             }
-                        });
+                        },
+                    );
                 } else {
                     for (row, dst) in out.iter_mut().enumerate() {
                         let start = row * in_dim;
@@ -352,7 +350,7 @@ impl QuantizedMatrix {
             } => {
                 let qx = &mut q_input_scratch[..self.in_dim];
                 let n_blk = *blocks_per_row;
-                let use_nta = self.weight_bytes() >= NTA_PREFETCH_MIN_BYTES;
+                let in_dim = self.in_dim;
 
                 with_quantized_q8_blocks(x, qx, n_blk, |qx_ref, x_scales, x_bias, all_zero| {
                     if all_zero {
@@ -360,36 +358,22 @@ impl QuantizedMatrix {
                         return;
                     }
 
-                    let in_dim = self.in_dim;
                     if self.out_dim.saturating_mul(in_dim) >= PARALLEL_MATVEC_MIN_MACS {
-                        out.par_chunks_mut(PARALLEL_ROW_CHUNK)
-                            .enumerate()
-                            .for_each(|(chunk_idx, chunk)| {
+                        out.par_chunks_mut(PARALLEL_ROW_CHUNK).enumerate().for_each(
+                            |(chunk_idx, chunk)| {
                                 let row0 = chunk_idx * PARALLEL_ROW_CHUNK;
-                                compute_q4_row_range(
-                                    blocks,
-                                    n_blk,
-                                    row0,
-                                    chunk,
-                                    qx_ref,
-                                    x_scales,
-                                    x_bias,
-                                    in_dim,
-                                    use_nta,
-                                );
-                            });
-                    } else {
-                        compute_q4_row_range(
-                            blocks,
-                            n_blk,
-                            0,
-                            out,
-                            qx_ref,
-                            x_scales,
-                            x_bias,
-                            in_dim,
-                            use_nta,
+                                for (i, dst) in chunk.iter_mut().enumerate() {
+                                    let row = row0 + i;
+                                    let row_blocks = &blocks[row * n_blk..(row + 1) * n_blk];
+                                    *dst = dot_q4_row(row_blocks, qx_ref, x_scales, x_bias, in_dim);
+                                }
+                            },
                         );
+                    } else {
+                        for (row, dst) in out.iter_mut().enumerate() {
+                            let row_blocks = &blocks[row * n_blk..(row + 1) * n_blk];
+                            *dst = dot_q4_row(row_blocks, qx_ref, x_scales, x_bias, in_dim);
+                        }
                     }
                 });
             }
@@ -462,13 +446,13 @@ impl QuantizedMatrix {
                     if all_zero {
                         return Some((rows[0], 0.0_f32));
                     }
-                    let dot_fn = select_q4_dot_fn();
                     if rows.len() >= PARALLEL_SPARSE_THRESHOLD {
                         rows.par_iter()
                             .filter(|&&row| row < out_dim)
                             .map(|&row| {
                                 let row_blocks = &blocks[row * n_blk..(row + 1) * n_blk];
-                                let score = dot_fn(row_blocks, qx_ref, x_scales, x_bias, in_dim);
+                                let score =
+                                    dot_q4_row(row_blocks, qx_ref, x_scales, x_bias, in_dim);
                                 (row, score)
                             })
                             .reduce_with(pick_better)
@@ -479,7 +463,7 @@ impl QuantizedMatrix {
                                 continue;
                             }
                             let row_blocks = &blocks[row * n_blk..(row + 1) * n_blk];
-                            let score = dot_fn(row_blocks, qx_ref, x_scales, x_bias, in_dim);
+                            let score = dot_q4_row(row_blocks, qx_ref, x_scales, x_bias, in_dim);
                             best_pair = Some(match best_pair {
                                 Some(curr) => pick_better(curr, (row, score)),
                                 None => (row, score),
@@ -584,7 +568,6 @@ impl QuantizedMatrix {
                         out_scores.resize(rows.len(), 0.0);
                         return;
                     }
-                    let dot_fn = select_q4_dot_fn();
                     if rows.len() >= PARALLEL_SPARSE_THRESHOLD {
                         out_scores.resize(rows.len(), 0.0);
                         out_scores
@@ -593,7 +576,7 @@ impl QuantizedMatrix {
                             .for_each(|(dst, &row)| {
                                 if row < out_dim {
                                     let row_blocks = &blocks[row * n_blk..(row + 1) * n_blk];
-                                    *dst = dot_fn(row_blocks, qx_ref, x_scales, x_bias, in_dim);
+                                    *dst = dot_q4_row(row_blocks, qx_ref, x_scales, x_bias, in_dim);
                                 } else {
                                     *dst = f32::NEG_INFINITY;
                                 }
@@ -603,9 +586,8 @@ impl QuantizedMatrix {
                         for &row in rows {
                             if row < out_dim {
                                 let row_blocks = &blocks[row * n_blk..(row + 1) * n_blk];
-                                out_scores.push(dot_fn(
-                                    row_blocks, qx_ref, x_scales, x_bias, in_dim,
-                                ));
+                                out_scores
+                                    .push(dot_q4_row(row_blocks, qx_ref, x_scales, x_bias, in_dim));
                             } else {
                                 out_scores.push(f32::NEG_INFINITY);
                             }
@@ -685,12 +667,8 @@ where
     if n_blocks <= MAX_STACK_Q4_BLOCKS {
         let mut x_scales = [0.0_f32; MAX_STACK_Q4_BLOCKS];
         let mut x_bias = [0.0_f32; MAX_STACK_Q4_BLOCKS];
-        let all_zero = quantize_q8_blocks_into(
-            x,
-            qx,
-            &mut x_scales[..n_blocks],
-            &mut x_bias[..n_blocks],
-        );
+        let all_zero =
+            quantize_q8_blocks_into(x, qx, &mut x_scales[..n_blocks], &mut x_bias[..n_blocks]);
         f(qx, &x_scales[..n_blocks], &x_bias[..n_blocks], all_zero)
     } else {
         let mut x_scales = vec![0.0_f32; n_blocks];
@@ -740,223 +718,63 @@ fn quantize_q8_blocks_into(
     all_zero
 }
 
-type Q4DotFn = fn(&[Q4Block], &[i8], &[f32], &[f32], usize) -> f32;
-
+/// Produto escalar de 1 bloco Q4 (32 pesos) × Q8 (32 ativações) em Rust 100% seguro.
+/// Tamanhos fixos (`16` e `32`) removem bounds checks e permitem auto-vetorização AVX2 / ARM NEON.
 #[inline]
-fn select_q4_dot_fn() -> Q4DotFn {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx2")
-            && std::arch::is_x86_feature_detected!("fma")
-            && std::arch::is_x86_feature_detected!("f16c")
-        {
-            return dot_q4_row_avx2_trampoline;
-        }
-    }
-    dot_q4_row_scalar
+fn dot_q4_block(qs: &[u8; Q4_BLOCK_SIZE / 2], qx: &[i8; Q4_BLOCK_SIZE]) -> i32 {
+    let (qx_lo, qx_hi) = qx.split_at(Q4_BLOCK_SIZE / 2);
+    let lo: i32 = qs
+        .iter()
+        .zip(qx_lo)
+        .map(|(&p, &q)| i32::from(p & 0x0F) * i32::from(q))
+        .sum();
+    let hi: i32 = qs
+        .iter()
+        .zip(qx_hi)
+        .map(|(&p, &q)| i32::from(p >> 4) * i32::from(q))
+        .sum();
+    lo + hi
 }
 
-#[allow(clippy::too_many_arguments)]
-fn compute_q4_row_range(
-    blocks: &[Q4Block],
-    blocks_per_row: usize,
-    row0: usize,
-    out_slice: &mut [f32],
-    qx: &[i8],
-    x_scales: &[f32],
-    x_bias: &[f32],
-    in_dim: usize,
-    use_nta: bool,
-) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx2")
-            && std::arch::is_x86_feature_detected!("fma")
-            && std::arch::is_x86_feature_detected!("f16c")
-        {
-            // SAFETY: AVX2, FMA e F16C verificados acima em runtime.
-            unsafe {
-                compute_q4_row_range_avx2(
-                    blocks,
-                    blocks_per_row,
-                    row0,
-                    out_slice,
-                    qx,
-                    x_scales,
-                    x_bias,
-                    in_dim,
-                    use_nta,
-                );
-            }
-            return;
-        }
-    }
-
-    let _ = use_nta;
-    for (i, dst) in out_slice.iter_mut().enumerate() {
-        let row = row0 + i;
-        let row_blocks = &blocks[row * blocks_per_row..(row + 1) * blocks_per_row];
-        *dst = dot_q4_row_scalar(row_blocks, qx, x_scales, x_bias, in_dim);
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-fn dot_q4_row_avx2_trampoline(
+/// Produto escalar completo de uma linha Q4 contra `qx` quantizado em blocos Q8.
+fn dot_q4_row(
     blocks: &[Q4Block],
     qx: &[i8],
     x_scales: &[f32],
     x_bias: &[f32],
     in_dim: usize,
 ) -> f32 {
-    // SAFETY: apenas chamado após `is_x86_feature_detected!` em `select_q4_dot_fn`.
-    unsafe { dot_q4_row_avx2(blocks, qx, x_scales, x_bias, in_dim) }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
-#[allow(clippy::too_many_arguments)]
-unsafe fn compute_q4_row_range_avx2(
-    blocks: &[Q4Block],
-    blocks_per_row: usize,
-    row0: usize,
-    out_slice: &mut [f32],
-    qx: &[i8],
-    x_scales: &[f32],
-    x_bias: &[f32],
-    in_dim: usize,
-    use_nta: bool,
-) {
-    use std::arch::x86_64::{_MM_HINT_NTA, _mm_prefetch};
-
-    let count = out_slice.len();
-    for (i, dst) in out_slice.iter_mut().enumerate() {
-        let row = row0 + i;
-        if use_nta && i + 1 < count {
-            let next_ptr = blocks[(row + 1) * blocks_per_row..].as_ptr().cast::<i8>();
-            // SAFETY: `row + 1` está dentro de `blocks` e `_mm_prefetch` apenas emite hint de cache.
-            unsafe {
-                _mm_prefetch::<_MM_HINT_NTA>(next_ptr);
-            }
-        }
-        let row_blocks = &blocks[row * blocks_per_row..(row + 1) * blocks_per_row];
-        // SAFETY: AVX2, FMA e F16C estão habilitados nesta função.
-        *dst = unsafe { dot_q4_row_avx2(row_blocks, qx, x_scales, x_bias, in_dim) };
-    }
-}
-
-/// Kernel AVX2 + FMA + F16C: processa 32 pesos Q4 por bloco usando `vpmaddubsw` + `vpmaddwd` + `vfmadd231ps`
-/// e faz apenas **1 redução horizontal por linha** no final.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
-unsafe fn dot_q4_row_avx2(
-    blocks: &[Q4Block],
-    qx: &[i8],
-    x_scales: &[f32],
-    x_bias: &[f32],
-    in_dim: usize,
-) -> f32 {
-    use std::arch::x86_64::{
-        __m128i, __m256i, _mm_add_ps, _mm_add_ss, _mm_and_si128, _mm_cvtph_ps, _mm_cvtsi32_si128,
-        _mm_cvtss_f32, _mm_loadu_si128, _mm_movehdup_ps, _mm_movehl_ps, _mm_set1_epi8,
-        _mm_srli_epi16, _mm256_castps256_ps128, _mm256_cvtepi32_ps, _mm256_extractf128_ps,
-        _mm256_fmadd_ps, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16,
-        _mm256_set_m128i, _mm256_set1_epi16, _mm256_set1_ps, _mm256_setzero_ps,
-    };
-
     let full_blocks = in_dim / Q4_BLOCK_SIZE;
     let rem = in_dim % Q4_BLOCK_SIZE;
-
-    // SAFETY: AVX2/FMA/F16C ativos pelo `#[target_feature]`; limites validados por `full_blocks` e `rem`.
-    unsafe {
-        let mask_0f = _mm_set1_epi8(0x0F);
-        let ones_16 = _mm256_set1_epi16(1);
-        let mut acc_f32 = _mm256_setzero_ps();
-        let mut bias_acc = 0.0_f32;
-
-        for b in 0..full_blocks {
-            let blk = &blocks[b];
-            let w_scale = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(i32::from(blk.scale_f16))));
-            let combined = w_scale * x_scales[b];
-            bias_acc = w_scale.mul_add(x_bias[b], bias_acc);
-
-            let raw = _mm_loadu_si128(blk.qs.as_ptr().cast::<__m128i>());
-            let lo = _mm_and_si128(raw, mask_0f);
-            let hi = _mm_and_si128(_mm_srli_epi16(raw, 4), mask_0f);
-            let w_u4 = _mm256_set_m128i(hi, lo);
-
-            let qx_vec =
-                _mm256_loadu_si256(qx.as_ptr().add(b * Q4_BLOCK_SIZE).cast::<__m256i>());
-            let prod_16 = _mm256_maddubs_epi16(w_u4, qx_vec);
-            let prod_32 = _mm256_madd_epi16(prod_16, ones_16);
-            let prod_f = _mm256_cvtepi32_ps(prod_32);
-            acc_f32 = _mm256_fmadd_ps(prod_f, _mm256_set1_ps(combined), acc_f32);
-        }
-
-        if rem > 0 {
-            let b = full_blocks;
-            let blk = &blocks[b];
-            let w_scale = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(i32::from(blk.scale_f16))));
-            let combined = w_scale * x_scales[b];
-            bias_acc = w_scale.mul_add(x_bias[b], bias_acc);
-
-            let mut tail_qx = [0_i8; Q4_BLOCK_SIZE];
-            tail_qx[..rem].copy_from_slice(&qx[b * Q4_BLOCK_SIZE..in_dim]);
-
-            let raw = _mm_loadu_si128(blk.qs.as_ptr().cast::<__m128i>());
-            let lo = _mm_and_si128(raw, mask_0f);
-            let hi = _mm_and_si128(_mm_srli_epi16(raw, 4), mask_0f);
-            let w_u4 = _mm256_set_m128i(hi, lo);
-
-            let qx_vec = _mm256_loadu_si256(tail_qx.as_ptr().cast::<__m256i>());
-            let prod_16 = _mm256_maddubs_epi16(w_u4, qx_vec);
-            let prod_32 = _mm256_madd_epi16(prod_16, ones_16);
-            let prod_f = _mm256_cvtepi32_ps(prod_32);
-            acc_f32 = _mm256_fmadd_ps(prod_f, _mm256_set1_ps(combined), acc_f32);
-        }
-
-        let hi128 = _mm256_extractf128_ps(acc_f32, 1);
-        let lo128 = _mm256_castps256_ps128(acc_f32);
-        let sum128 = _mm_add_ps(lo128, hi128);
-        let shuf = _mm_movehdup_ps(sum128);
-        let sums = _mm_add_ps(sum128, shuf);
-        let shuf2 = _mm_movehl_ps(sums, sums);
-        _mm_cvtss_f32(_mm_add_ss(sums, shuf2)) + bias_acc
-    }
-}
-
-/// Referência portável (x86 sem AVX2 e ARM/Raspberry Pi).
-fn dot_q4_row_scalar(
-    blocks: &[Q4Block],
-    qx: &[i8],
-    x_scales: &[f32],
-    x_bias: &[f32],
-    in_dim: usize,
-) -> f32 {
-    let half = Q4_BLOCK_SIZE / 2;
     let mut total = 0.0_f32;
 
-    for (b, blk) in blocks.iter().enumerate() {
+    for ((blk, qx_chunk), (&xs, &xb)) in blocks[..full_blocks]
+        .iter()
+        .zip(qx.chunks_exact(Q4_BLOCK_SIZE))
+        .zip(x_scales[..full_blocks].iter().zip(&x_bias[..full_blocks]))
+    {
         let w_scale = f16_to_f32(blk.scale_f16);
-        let combined = w_scale * x_scales[b];
+        let combined = w_scale * xs;
         if combined == 0.0 {
             continue;
         }
-        let base = b * Q4_BLOCK_SIZE;
-        let end = (base + Q4_BLOCK_SIZE).min(in_dim);
-        let qx_blk = &qx[base..end];
-
-        let mut acc = 0_i32;
-        for (j, &packed) in blk.qs.iter().enumerate() {
-            let lo = i32::from(packed & 0x0F);
-            let hi = i32::from(packed >> 4);
-            if let Some(&q0) = qx_blk.get(j) {
-                acc += lo * i32::from(q0);
-            }
-            if let Some(&q1) = qx_blk.get(j + half) {
-                acc += hi * i32::from(q1);
-            }
+        if let Ok(qx_arr) = <&[i8; Q4_BLOCK_SIZE]>::try_from(qx_chunk) {
+            let acc = dot_q4_block(&blk.qs, qx_arr);
+            total = (acc as f32).mul_add(combined, w_scale.mul_add(xb, total));
         }
-        total += (acc as f32) * combined + w_scale * x_bias[b];
+    }
+
+    if rem > 0 {
+        let b = full_blocks;
+        let blk = &blocks[b];
+        let w_scale = f16_to_f32(blk.scale_f16);
+        let combined = w_scale * x_scales[b];
+        if combined != 0.0 {
+            let mut tail_qx = [0_i8; Q4_BLOCK_SIZE];
+            tail_qx[..rem].copy_from_slice(&qx[b * Q4_BLOCK_SIZE..in_dim]);
+            let acc = dot_q4_block(&blk.qs, &tail_qx);
+            total = (acc as f32).mul_add(combined, w_scale.mul_add(x_bias[b], total));
+        }
     }
 
     total
@@ -1006,41 +824,29 @@ fn f32_to_f16(value: f32) -> u16 {
     sign | (exp_u16 << 10) | mant_u16
 }
 
-/// Conversão IEEE-754 `binary16 -> f32` (usa instrução `vcvtph2ps` quando `f16c` está ativo).
+/// Conversão IEEE-754 `binary16 -> f32` em Rust 100% seguro.
 #[inline]
 fn f16_to_f32(bits: u16) -> f32 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "f16c"))]
-    {
-        // SAFETY: `f16c` garantido pelo `cfg` em tempo de compilação.
-        unsafe {
-            use std::arch::x86_64::{_mm_cvtph_ps, _mm_cvtsi32_si128, _mm_cvtss_f32};
-            _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(i32::from(bits))))
-        }
-    }
+    let sign = u32::from(bits & 0x8000) << 16;
+    let exp = u32::from((bits >> 10) & 0x1F);
+    let mant = u32::from(bits & 0x03FF);
 
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "f16c")))]
-    {
-        let sign = u32::from(bits & 0x8000) << 16;
-        let exp = u32::from((bits >> 10) & 0x1F);
-        let mant = u32::from(bits & 0x03FF);
-
-        let f32_bits = if exp == 0 {
-            if mant == 0 {
-                sign
-            } else {
-                let shift = mant.leading_zeros() - 21;
-                let norm_mant = (mant << shift) & 0x03FF;
-                let f32_exp = 127 - 14 - shift;
-                sign | (f32_exp << 23) | (norm_mant << 13)
-            }
-        } else if exp == 31 {
-            sign | 0x7F80_0000 | (mant << 13)
+    let f32_bits = if exp == 0 {
+        if mant == 0 {
+            sign
         } else {
-            sign | ((exp + (127 - 15)) << 23) | (mant << 13)
-        };
+            let shift = mant.leading_zeros() - 21;
+            let norm_mant = (mant << shift) & 0x03FF;
+            let f32_exp = 127 - 14 - shift;
+            sign | (f32_exp << 23) | (norm_mant << 13)
+        }
+    } else if exp == 31 {
+        sign | 0x7F80_0000 | (mant << 13)
+    } else {
+        sign | ((exp + (127 - 15)) << 23) | (mant << 13)
+    };
 
-        f32::from_bits(f32_bits)
-    }
+    f32::from_bits(f32_bits)
 }
 
 /// Desempate determinístico independente da ordem de threads do `rayon`.
@@ -1102,6 +908,38 @@ fn dot_i8_unrolled(a: &[i8], b: &[i8]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dot_q4_row_reference(
+        blocks: &[Q4Block],
+        qx: &[i8],
+        x_scales: &[f32],
+        x_bias: &[f32],
+        in_dim: usize,
+    ) -> f32 {
+        let half = Q4_BLOCK_SIZE / 2;
+        let mut total = 0.0_f32;
+        for (b, blk) in blocks.iter().enumerate() {
+            let w_scale = f16_to_f32(blk.scale_f16);
+            let combined = w_scale * x_scales[b];
+            if combined == 0.0 {
+                continue;
+            }
+            let base = b * Q4_BLOCK_SIZE;
+            let end = (base + Q4_BLOCK_SIZE).min(in_dim);
+            let qx_blk = &qx[base..end];
+            let mut acc = 0_i32;
+            for (j, &packed) in blk.qs.iter().enumerate() {
+                if let Some(&q0) = qx_blk.get(j) {
+                    acc += i32::from(packed & 0x0F) * i32::from(q0);
+                }
+                if let Some(&q1) = qx_blk.get(j + half) {
+                    acc += i32::from(packed >> 4) * i32::from(q1);
+                }
+            }
+            total += (acc as f32) * combined + w_scale * x_bias[b];
+        }
+        total
+    }
 
     #[test]
     fn quantized_matvec_matches_f32_within_small_tolerance()
@@ -1210,11 +1048,9 @@ mod tests {
                 "f16 mismatch for {val}: got {back}"
             );
         }
-        // Subnormal pequeno (2^-20)
         let sub = 2.0_f32.powi(-20);
         let back_sub = f16_to_f32(f32_to_f16(sub));
         assert!((back_sub - sub).abs() < 1e-7, "subnormal got {back_sub}");
-        // Saturação finita (nunca Inf)
         assert_eq!(f16_to_f32(f32_to_f16(100_000.0)), 65504.0);
     }
 
@@ -1243,7 +1079,6 @@ mod tests {
         let mut got_q4 = vec![0.0_f32; out_dim];
         q4.matvec_into(&x, &mut q_scratch, &mut got_q4);
 
-        // Correlação de cosseno entre saída F32 exata e saída Q4 deve ser > 0.995
         let mut exact = vec![0.0_f32; out_dim];
         for row in 0..out_dim {
             exact[row] = w[row * in_dim..(row + 1) * in_dim]
@@ -1261,7 +1096,7 @@ mod tests {
     }
 
     #[test]
-    fn q4_avx2_matches_scalar_for_aligned_and_unaligned_tail_dimensions()
+    fn q4_block_dot_matches_reference_for_aligned_and_unaligned_tail_dimensions()
     -> Result<(), Box<dyn std::error::Error>> {
         for in_dim in [1_usize, 7, 15, 16, 31, 32, 33, 63, 64, 100, 768] {
             let out_dim = 8;
@@ -1295,13 +1130,14 @@ mod tests {
 
             for row in 0..out_dim {
                 let row_blocks = &blocks[row * *blocks_per_row..(row + 1) * *blocks_per_row];
-                let scalar = dot_q4_row_scalar(row_blocks, &qx_ref, &x_scales, &x_bias, in_dim);
-                let diff = (got[row] - scalar).abs();
+                let expected =
+                    dot_q4_row_reference(row_blocks, &qx_ref, &x_scales, &x_bias, in_dim);
+                let diff = (got[row] - expected).abs();
                 assert!(
                     diff < 1e-4,
-                    "in_dim={in_dim}, row={row}: simd={} vs scalar={} (diff={diff})",
+                    "in_dim={in_dim}, row={row}: got={} vs expected={} (diff={diff})",
                     got[row],
-                    scalar
+                    expected
                 );
             }
         }
