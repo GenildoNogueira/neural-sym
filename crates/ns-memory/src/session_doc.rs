@@ -126,11 +126,10 @@ impl SessionDocumentStore {
                 let doc: TantivyDocument = searcher.doc(addr)?;
                 if let Some(raw_id) = doc.get_first(idx.id_field).and_then(|v| v.as_str()) {
                     let key = raw_id.to_lowercase();
-                    if seen.insert(key.clone()) {
-                        if let Some(&pos) = self.by_id.get(&key) {
+                    if seen.insert(key.clone())
+                        && let Some(&pos) = self.by_id.get(&key) {
                             results.push(self.spans[pos].clone());
                         }
-                    }
                 }
             }
         }
@@ -225,11 +224,10 @@ impl DocumentContext for SessionDocumentStore {
 
         for raw_id in span_ids.iter().take(MAX_READ_SPANS) {
             let key = raw_id.trim().to_lowercase();
-            if seen.insert(key.clone()) {
-                if let Some(&pos) = self.by_id.get(&key) {
+            if seen.insert(key.clone())
+                && let Some(&pos) = self.by_id.get(&key) {
                     out.push(self.spans[pos].clone());
                 }
-            }
         }
 
         Ok(out)
@@ -432,11 +430,10 @@ fn extract_leading_structured_id(text: &str) -> Option<String> {
     ];
 
     for (kw, tag) in prefixes {
-        if let Some(rest) = lower.strip_prefix(kw) {
-            if let Some(num) = read_first_number(rest) {
+        if let Some(rest) = lower.strip_prefix(kw)
+            && let Some(num) = read_first_number(rest) {
                 return Some(format!("{tag}_{num:02}"));
             }
-        }
     }
     None
 }

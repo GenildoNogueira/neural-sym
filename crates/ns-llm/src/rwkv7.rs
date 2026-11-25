@@ -1018,7 +1018,7 @@ impl Rwkv7Llm {
         vocab_bin: &[u8],
         safetensors_bytes: &[u8],
     ) -> Result<Self, LlmError> {
-        if cfg.head_dim == 0 || cfg.d_model % cfg.head_dim != 0 {
+        if cfg.head_dim == 0 || !cfg.d_model.is_multiple_of(cfg.head_dim) {
             return Err(LlmError::InvalidConfig(
                 "d_model must be divisible by positive head_dim",
             ));
@@ -1645,12 +1645,10 @@ impl Rwkv7Llm {
             let tok = scratch.copy_tokens[slot];
             if mask.is_allowed(tok)
                 && let Ok(idx) = usize::try_from(tok)
-            {
-                if let Some(acc) = scratch.copy_vocab_acc.get_mut(idx) {
+                && let Some(acc) = scratch.copy_vocab_acc.get_mut(idx) {
                     *acc += weight;
                     any_allowed_copy = true;
                 }
-            }
         }
 
         let d_model = self.cfg.d_model;
@@ -1713,11 +1711,10 @@ impl Rwkv7Llm {
         }
 
         for &tok in &scratch.copy_tokens {
-            if let Ok(idx) = usize::try_from(tok) {
-                if let Some(acc) = scratch.copy_vocab_acc.get_mut(idx) {
+            if let Ok(idx) = usize::try_from(tok)
+                && let Some(acc) = scratch.copy_vocab_acc.get_mut(idx) {
                     *acc = 0.0;
                 }
-            }
         }
 
         best_row
@@ -1751,11 +1748,10 @@ impl Rwkv7Llm {
             self.forward_hidden(id, &mut state)?;
 
             let next_idx = idx.saturating_add(1);
-            if next_idx >= record_from {
-                if let Some(&next_tok) = prompt_ids.get(next_idx) {
+            if next_idx >= record_from
+                && let Some(&next_tok) = prompt_ids.get(next_idx) {
                     self.record_copy_entry(&mut state, next_tok);
                 }
-            }
         }
 
         let mut matcher = Matcher::new(self.parser_factory.create_parser(self.grammar.clone()));

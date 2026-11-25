@@ -219,14 +219,13 @@ pub fn extract_prompt_entities(prompt: &str) -> Vec<(String, SlotKind)> {
                     register(w, SlotKind::PromptEntity);
                 }
             }
-        } else if let Some(rest) = trimmed.strip_prefix('[') {
-            if let Some(end_bracket) = rest.find(']') {
+        } else if let Some(rest) = trimmed.strip_prefix('[')
+            && let Some(end_bracket) = rest.find(']') {
                 let span_id = &rest[..end_bracket];
                 if !span_id.is_empty() && !span_id.contains(char::is_whitespace) {
                     register(span_id, SlotKind::DocumentToc);
                 }
             }
-        }
     }
 
     order

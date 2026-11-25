@@ -266,8 +266,8 @@ pub async fn generate_verified_jsonl(
 
         // 5. Travessia de grafo multi-hop quando o objeto aponta para outra entidade existente
         let obj_key = fact.object.trim().to_lowercase();
-        if known_subjects.contains(&obj_key) && obj_key != fact.subject {
-            if let Ok(reached) = memory.traverse(&fact.subject, 2).await
+        if known_subjects.contains(&obj_key) && obj_key != fact.subject
+            && let Ok(reached) = memory.traverse(&fact.subject, 2).await
                 && reached.len() >= 2
             {
                 traj_seq = traj_seq.saturating_add(1);
@@ -309,7 +309,6 @@ pub async fn generate_verified_jsonl(
                     all_samples.extend(samples);
                 }
             }
-        }
     }
 
     if let Some(parent) = output_path.parent().filter(|p| !p.as_os_str().is_empty()) {

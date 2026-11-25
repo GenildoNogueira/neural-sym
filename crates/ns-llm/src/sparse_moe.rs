@@ -404,7 +404,7 @@ mod tests {
 
         // Roteador força especialistas 1 e 4 como únicos vencedores para x = [1, 1, ..., 1]
         let mut router_w = vec![0.0_f32; num_experts * d];
-        router_w[1 * d] = 10.0; // logit alto -> vencedor #1
+        router_w[d] = 10.0; // logit alto -> vencedor #1
         router_w[4 * d] = 10.0; // logit empatado -> vencedor #2 (softmax 0.5 / 0.5)
         for inactive in [0_usize, 2, 3, 5] {
             router_w[inactive * d] = -10.0;
