@@ -21,6 +21,7 @@ use crate::isa_bank::{
     NeuralEntityBank, SlotFilter, extract_prompt_entities, find_entity_token_span,
 };
 use crate::quant::QuantizedMatrix;
+use crate::{SparseMoeFfn, SparseMoeScratch};
 
 const NEG_EXP_NEG_HALF: f32 = -0.606_530_66;
 const ISA_OP_COUNT: usize = 9;
@@ -543,7 +544,7 @@ impl SparseColQuantizedMatrix {
         })
     }
 
-    fn load_from_safetensors(
+    pub(crate) fn load_from_safetensors(
         st: &SafeTensors<'_>,
         name: &str,
         out_dim: usize,
@@ -642,37 +643,6 @@ impl SparseColQuantizedMatrix {
 
     #[must_use]
     pub const fn weight_bytes(&self) -> usize {
-        self.cols_q.len() + self.col_scales.len() * std::mem::size_of::<f32>()
-    }
-
-    /// Acumula `out += W * act` lendo da RAM **apenas** colunas com `act[col] > 0.0`.
-    /// Retorna quantas colunas ativas foram lidas.
-    pub fn accumulate_sparse(&self, act: &[f32], out: &mut [f32]) -> usize {
-        debug_assert_eq!(act.len(), self.in_dim);
-        debug_assert_eq!(out.len(), self.out_dim);
-
-        let mut active_cols: usize = 0;
-        let out_dim = self.out_dim;
-
-        for (col, &a) in act.iter().enumerate() {
-            if a <= 0.0 {
-                continue;
-            }
-            let factor = a * self.col_scales[col];
-            if factor == 0.0 {
-                continue;
-            }
-            active_cols += 1;
-            let col_slice = &self.cols_q[col * out_dim..(col + 1) * out_dim];
-            for (dst, &q) in out.iter_mut().zip(col_slice.iter()) {
-                *dst += f32::from(q) * factor;
-            }
-        }
-
-        active_cols
-    }
-
-    const fn weight_bytes(&self) -> usize {
         self.cols_q.len() + self.col_scales.len() * std::mem::size_of::<f32>()
     }
 }
@@ -878,11 +848,11 @@ impl Rwkv7Scratch {
         let copy_cap = if copy_dim > 0 { cfg.copy_max_len } else { 0 };
         let copy_acc_len = if copy_dim > 0 { cfg.vocab_size } else { 0 };
 
-        if cfg.moe_num_experts > 0 {
+        let moe = if cfg.moe_num_experts > 0 {
             Some(SparseMoeScratch::new(cfg.moe_num_experts, cfg.ffn_dim))
         } else {
             None
-        }
+        };
 
         Self {
             x_emb: vec![0.0; d].into_boxed_slice(),
@@ -916,6 +886,7 @@ impl Rwkv7Scratch {
             copy_attn: Vec::with_capacity(copy_cap),
             vocab_scores: Vec::with_capacity(cfg.vocab_size.min(512)),
             copy_vocab_acc: vec![0.0; copy_acc_len].into_boxed_slice(),
+            moe,
         }
     }
 }
@@ -927,6 +898,8 @@ pub struct Rwkv7State {
     scratch: Rwkv7Scratch,
     pub total_ffn_cols: u64,
     pub active_ffn_cols: u64,
+    pub total_ffn_bytes: u64,
+    pub read_ffn_bytes: u64,
 }
 
 impl Rwkv7State {
@@ -942,6 +915,8 @@ impl Rwkv7State {
             scratch: Rwkv7Scratch::new(cfg),
             total_ffn_cols: 0,
             active_ffn_cols: 0,
+            total_ffn_bytes: 0,
+            read_ffn_bytes: 0,
         }
     }
 
@@ -970,6 +945,15 @@ impl Rwkv7State {
     #[must_use]
     pub fn copy_bank_len(&self) -> usize {
         self.scratch.copy_tokens.len()
+    }
+
+    /// Fração física de bytes da FFN que não precisaram ser lidos da RAM (0.0 .. 1.0).
+    #[must_use]
+    pub fn ffn_ram_skip_ratio(&self) -> f64 {
+        if self.total_ffn_bytes == 0 {
+            return 0.0;
+        }
+        1.0 - (self.read_ffn_bytes as f64) / (self.total_ffn_bytes as f64)
     }
 }
 
@@ -1505,8 +1489,7 @@ impl Rwkv7Llm {
                     state.active_ffn_cols = state.active_ffn_cols.saturating_add(active as u64);
                     state.total_ffn_bytes =
                         state.total_ffn_bytes.saturating_add(total_bytes as u64);
-                    state.read_ffn_bytes =
-                        state.read_ffn_bytes.saturating_add(read_bytes as u64);
+                    state.read_ffn_bytes = state.read_ffn_bytes.saturating_add(read_bytes as u64);
                 }
                 ChannelMixingFfn::SparseMoe(moe) => {
                     if let Some(ref mut moe_sc) = scratch.moe {
@@ -1518,8 +1501,9 @@ impl Rwkv7Llm {
                         );
                         state.total_ffn_cols =
                             state.total_ffn_cols.saturating_add(stats.cols_total as u64);
-                        state.active_ffn_cols =
-                            state.active_ffn_cols.saturating_add(stats.cols_active as u64);
+                        state.active_ffn_cols = state
+                            .active_ffn_cols
+                            .saturating_add(stats.cols_active as u64);
                         state.total_ffn_bytes = state
                             .total_ffn_bytes
                             .saturating_add(stats.total_weight_bytes as u64);
@@ -1528,13 +1512,6 @@ impl Rwkv7Llm {
                     }
                 }
             }
-
-            let active = block
-                .cm
-                .value
-                .accumulate_sparse(&scratch.cm_k, &mut scratch.x);
-            state.total_ffn_cols = state.total_ffn_cols.saturating_add(self.cfg.ffn_dim as u64);
-            state.active_ffn_cols = state.active_ffn_cols.saturating_add(active as u64);
         }
 
         layer_norm_into(&scratch.x, &self.ln_out, eps, &mut scratch.x_out);
