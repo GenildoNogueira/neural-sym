@@ -57,7 +57,10 @@ fn bench_shape(label: &str, out_dim: usize, in_dim: usize, iters: usize) {
 
 fn main() {
     println!();
-    println!("Comparativo QuantizedMatrix: W8A8 vs Q4A8 (bloco 32, AVX2+FMA+F16C)");
+    println!(
+        "Comparativo QuantizedMatrix: W8A8 vs Q4A8 (bloco 32, backend: {})",
+        ns_llm::quant::active_q4_backend()
+    );
     println!(
         "{:<22} | {:>10} | {:>10} | {:>9} | {:>9} | {:>6} | CosSim",
         "Matriz (RWKV-7 0.1B)", "RAM W8", "RAM Q4", "W8/cham.", "Q4/cham.", "Ganho"

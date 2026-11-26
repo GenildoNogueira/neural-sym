@@ -16,6 +16,7 @@ rust-version = "1.95"
 license = "MIT"
 
 [workspace.dependencies]
+ns-kernels = { path = "crates/ns-kernels" }
 ns-core = { path = "crates/ns-core" }
 ns-memory = { path = "crates/ns-memory" }
 ns-llm = { path = "crates/ns-llm" }

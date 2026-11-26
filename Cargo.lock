@@ -1503,11 +1503,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ns-kernels"
+version = "0.1.0"
+
+[[package]]
 name = "ns-llm"
 version = "0.1.0"
 dependencies = [
  "llguidance",
  "ns-core",
+ "ns-kernels",
  "rayon",
  "safetensors",
  "serde",

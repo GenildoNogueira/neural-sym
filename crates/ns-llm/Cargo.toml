@@ -15,6 +15,7 @@ custom-rwkv = [
     "dep:serde",
     "dep:tokenizers",
     "dep:toktrie_hf_tokenizers",
+    "dep:ns-kernels",
 ]
 local-gpu = [
     "dep:llguidance",
@@ -24,6 +25,7 @@ local-gpu = [
 [dependencies]
 llguidance = { workspace = true, optional = true }
 ns-core.workspace = true
+ns-kernels = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
 safetensors = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }

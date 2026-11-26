@@ -1,0 +1,9 @@
+[package]
+name = "ns-kernels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Kernels SIMD isolados (AVX2/FMA/F16C e ARM64 NEON) para matvec Q4 do NeuroSym"
+
+[dependencies]
