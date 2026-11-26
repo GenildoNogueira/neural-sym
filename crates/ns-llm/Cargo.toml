@@ -58,3 +58,7 @@ required-features = ["custom-rwkv"]
 [[example]]
 name = "q4_vs_w8_bench"
 required-features = ["custom-rwkv"]
+
+[[example]]
+name = "matmul4_bench"
+required-features = ["custom-rwkv"]

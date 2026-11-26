@@ -1,6 +1,8 @@
 use llguidance::toktrie::{SimpleVob, TokenId};
 pub use ns_kernels::{Q4_BLOCK_SIZE, active_q4_backend};
-use ns_kernels::{Q4Block, compute_q4_row_range, dot_q4_row, f16_to_f32, f32_to_f16};
+use ns_kernels::{
+    Q4Block, compute_q4_row_range, compute_q4_row_range_x4, dot_q4_row, f16_to_f32, f32_to_f16,
+};
 use rayon::prelude::*;
 use safetensors::{Dtype, SafeTensors};
 
@@ -10,8 +12,8 @@ use crate::error::LlmError;
 /// `127 * 127 * 131_072 = 2_114_060_288 <= i32::MAX (2_147_483_647)`.
 pub const MAX_QUANT_IN_DIM: usize = 131_072;
 
-/// Máximo de blocos de entrada mantidos na stack sem alocação (`256 * 32 = 8192` dimensões).
-const MAX_STACK_Q4_BLOCKS: usize = 256;
+/// Máximo de blocos de entrada mantidos na stack sem alocação (`512 * 32 = 16.384` dims: cobre 0.1B, 1.5B e 2.9B+).
+const MAX_STACK_Q4_BLOCKS: usize = 512;
 
 /// Volume mínimo de multiplicações (`out_dim * in_dim`) para ativar o Rayon em `matvec_into`.
 const PARALLEL_MATVEC_MIN_MACS: usize = 512 * 1024;
@@ -35,18 +37,24 @@ pub enum QuantFormat {
 }
 
 impl QuantFormat {
-    /// Lê a variável de ambiente `NS_WEIGHT_QUANT` (`q4` ativa 4-bit; qualquer outro valor mantém `W8`).
+    /// Lê a variável de ambiente `NS_WEIGHT_QUANT` (`q4` / `q4_all` / `q4_large` / `w8`).
     #[must_use]
     pub fn from_env() -> Self {
         match std::env::var("NS_WEIGHT_QUANT") {
-            Ok(val) if val.eq_ignore_ascii_case("q4") => Self::Q4,
+            Ok(val)
+                if val.eq_ignore_ascii_case("q4")
+                    || val.eq_ignore_ascii_case("q4_all")
+                    || val.eq_ignore_ascii_case("q4_large") =>
+            {
+                Self::Q4
+            }
             _ => Self::W8,
         }
     }
 
-    /// Resolve o formato por matriz a partir de `NS_WEIGHT_QUANT`:
-    /// - `q4_large`: Q4 só em matrizes >= 1M pesos (`cm.key`, `head`); Time-Mixing fica 100% W8.
-    /// - `q4`: Q4 em matrizes >= 512k pesos (`tm.proj`, `cm.key`, `head`); LoRAs pequenos ficam W8.
+    /// Precisão mista por tamanho de matriz:
+    /// - `q4_large`: Q4 apenas em matrizes `>= 1M` pesos (`cm.key`, `head`); Time-Mixing 100% W8.
+    /// - `q4`: Q4 em matrizes `>= 512k` pesos (`tm.proj`, `cm.key`, `head`); LoRAs pequenos em W8.
     /// - `q4_all`: força Q4 em todas as matrizes.
     #[must_use]
     pub fn from_env_for_shape(out_dim: usize, in_dim: usize) -> Self {
@@ -392,6 +400,143 @@ impl QuantizedMatrix {
         }
     }
 
+    /// Calcula `outs[k] = W * xs[k]` para **4 trajetórias simultâneas (`M × 4`)**
+    /// lendo os pesos da matriz **uma única vez da RAM** (base do Best-of-N sem custo extra de banda).
+    pub fn matmul4_into(
+        &self,
+        xs: [&[f32]; 4],
+        q_inputs: [&mut [i8]; 4],
+        outs: [&mut [f32]; 4],
+    ) {
+        let in_dim = self.in_dim;
+        debug_assert!(xs.iter().all(|x| x.len() == in_dim));
+        debug_assert!(outs.iter().all(|o| o.len() == self.out_dim));
+        debug_assert!(q_inputs.iter().all(|q| q.len() >= in_dim));
+
+        let [q0, q1, q2, q3] = q_inputs;
+        let q0 = &mut q0[..in_dim];
+        let q1 = &mut q1[..in_dim];
+        let q2 = &mut q2[..in_dim];
+        let q3 = &mut q3[..in_dim];
+
+        match &self.storage {
+            QuantizedStorage::W8 { data, scales } => {
+                let s0 = quantize_slice_symmetric(xs[0], q0);
+                let s1 = quantize_slice_symmetric(xs[1], q1);
+                let s2 = quantize_slice_symmetric(xs[2], q2);
+                let s3 = quantize_slice_symmetric(xs[3], q3);
+
+                if s0 == 0.0 && s1 == 0.0 && s2 == 0.0 && s3 == 0.0 {
+                    for out in outs {
+                        out.fill(0.0);
+                    }
+                    return;
+                }
+
+                let qx0: &[i8] = q0;
+                let qx1: &[i8] = q1;
+                let qx2: &[i8] = q2;
+                let qx3: &[i8] = q3;
+                let [out0, out1, out2, out3] = outs;
+
+                if self.out_dim.saturating_mul(in_dim).saturating_mul(4) >= PARALLEL_MATVEC_MIN_MACS
+                {
+                    (
+                        out0.par_chunks_mut(PARALLEL_ROW_CHUNK),
+                        out1.par_chunks_mut(PARALLEL_ROW_CHUNK),
+                        out2.par_chunks_mut(PARALLEL_ROW_CHUNK),
+                        out3.par_chunks_mut(PARALLEL_ROW_CHUNK),
+                    )
+                        .into_par_iter()
+                        .enumerate()
+                        .for_each(|(chunk_idx, (c0, c1, c2, c3))| {
+                            let row0 = chunk_idx * PARALLEL_ROW_CHUNK;
+                            for i in 0..c0.len() {
+                                let row = row0 + i;
+                                let w_row = &data[row * in_dim..(row + 1) * in_dim];
+                                let sw = scales[row];
+                                // Cada linha fica quente em L1 durante os 4 dots (1 única leitura de RAM).
+                                c0[i] = (dot_i8_unrolled(w_row, qx0) as f32) * (sw * s0);
+                                c1[i] = (dot_i8_unrolled(w_row, qx1) as f32) * (sw * s1);
+                                c2[i] = (dot_i8_unrolled(w_row, qx2) as f32) * (sw * s2);
+                                c3[i] = (dot_i8_unrolled(w_row, qx3) as f32) * (sw * s3);
+                            }
+                        });
+                } else {
+                    for row in 0..self.out_dim {
+                        let w_row = &data[row * in_dim..(row + 1) * in_dim];
+                        let sw = scales[row];
+                        out0[row] = (dot_i8_unrolled(w_row, qx0) as f32) * (sw * s0);
+                        out1[row] = (dot_i8_unrolled(w_row, qx1) as f32) * (sw * s1);
+                        out2[row] = (dot_i8_unrolled(w_row, qx2) as f32) * (sw * s2);
+                        out3[row] = (dot_i8_unrolled(w_row, qx3) as f32) * (sw * s3);
+                    }
+                }
+            }
+            QuantizedStorage::Q4 {
+                blocks,
+                blocks_per_row,
+            } => {
+                let n_blk = *blocks_per_row;
+                let use_nta = self.weight_bytes() >= NTA_PREFETCH_MIN_BYTES;
+
+                with_quantized_q8_blocks_x4(
+                    xs,
+                    [q0, q1, q2, q3],
+                    n_blk,
+                    |qx_refs, x_scales, x_bias, all_zero| {
+                        if all_zero.iter().all(|&z| z) {
+                            for out in outs {
+                                out.fill(0.0);
+                            }
+                            return;
+                        }
+
+                        let [out0, out1, out2, out3] = outs;
+                        if self.out_dim.saturating_mul(in_dim).saturating_mul(4)
+                            >= PARALLEL_MATVEC_MIN_MACS
+                        {
+                            (
+                                out0.par_chunks_mut(PARALLEL_ROW_CHUNK),
+                                out1.par_chunks_mut(PARALLEL_ROW_CHUNK),
+                                out2.par_chunks_mut(PARALLEL_ROW_CHUNK),
+                                out3.par_chunks_mut(PARALLEL_ROW_CHUNK),
+                            )
+                                .into_par_iter()
+                                .enumerate()
+                                .for_each(|(chunk_idx, (c0, c1, c2, c3))| {
+                                    let row0 = chunk_idx * PARALLEL_ROW_CHUNK;
+                                    compute_q4_row_range_x4(
+                                        blocks,
+                                        n_blk,
+                                        row0,
+                                        [c0, c1, c2, c3],
+                                        qx_refs,
+                                        x_scales,
+                                        x_bias,
+                                        in_dim,
+                                        use_nta,
+                                    );
+                                });
+                        } else {
+                            compute_q4_row_range_x4(
+                                blocks,
+                                n_blk,
+                                0,
+                                [out0, out1, out2, out3],
+                                qx_refs,
+                                x_scales,
+                                x_bias,
+                                in_dim,
+                                use_nta,
+                            );
+                        }
+                    },
+                );
+            }
+        }
+    }
+
     /// Avalia o produto escalar apenas sobre os índices de linha em `rows`
     /// e retorna o `TokenId` de maior score com desempate determinístico.
     pub fn argmax_rows(
@@ -681,6 +826,61 @@ where
         let mut x_bias = vec![0.0_f32; n_blocks];
         let all_zero = quantize_q8_blocks_into(x, qx, &mut x_scales, &mut x_bias);
         f(qx, &x_scales, &x_bias, all_zero)
+    }
+}
+
+fn with_quantized_q8_blocks_x4<R, F>(
+    xs: [&[f32]; 4],
+    qxs: [&mut [i8]; 4],
+    n_blocks: usize,
+    f: F,
+) -> R
+where
+    F: FnOnce([&[i8]; 4], [&[f32]; 4], [&[f32]; 4], [bool; 4]) -> R,
+{
+    let [q0, q1, q2, q3] = qxs;
+    if n_blocks <= MAX_STACK_Q4_BLOCKS {
+        let mut s0 = [0.0_f32; MAX_STACK_Q4_BLOCKS];
+        let mut s1 = [0.0_f32; MAX_STACK_Q4_BLOCKS];
+        let mut s2 = [0.0_f32; MAX_STACK_Q4_BLOCKS];
+        let mut s3 = [0.0_f32; MAX_STACK_Q4_BLOCKS];
+        let mut b0 = [0.0_f32; MAX_STACK_Q4_BLOCKS];
+        let mut b1 = [0.0_f32; MAX_STACK_Q4_BLOCKS];
+        let mut b2 = [0.0_f32; MAX_STACK_Q4_BLOCKS];
+        let mut b3 = [0.0_f32; MAX_STACK_Q4_BLOCKS];
+
+        let z0 = quantize_q8_blocks_into(xs[0], q0, &mut s0[..n_blocks], &mut b0[..n_blocks]);
+        let z1 = quantize_q8_blocks_into(xs[1], q1, &mut s1[..n_blocks], &mut b1[..n_blocks]);
+        let z2 = quantize_q8_blocks_into(xs[2], q2, &mut s2[..n_blocks], &mut b2[..n_blocks]);
+        let z3 = quantize_q8_blocks_into(xs[3], q3, &mut s3[..n_blocks], &mut b3[..n_blocks]);
+
+        f(
+            [q0, q1, q2, q3],
+            [&s0[..n_blocks], &s1[..n_blocks], &s2[..n_blocks], &s3[..n_blocks]],
+            [&b0[..n_blocks], &b1[..n_blocks], &b2[..n_blocks], &b3[..n_blocks]],
+            [z0, z1, z2, z3],
+        )
+    } else {
+        let mut s0 = vec![0.0_f32; n_blocks];
+        let mut s1 = vec![0.0_f32; n_blocks];
+        let mut s2 = vec![0.0_f32; n_blocks];
+        let mut s3 = vec![0.0_f32; n_blocks];
+        let mut b0 = vec![0.0_f32; n_blocks];
+        let mut b1 = vec![0.0_f32; n_blocks];
+        let mut b2 = vec![0.0_f32; n_blocks];
+        let mut b3 = vec![0.0_f32; n_blocks];
+
+        let z0 = quantize_q8_blocks_into(xs[0], q0, &mut s0, &mut b0);
+        let z1 = quantize_q8_blocks_into(xs[1], q1, &mut s1, &mut b1);
+        let z2 = quantize_q8_blocks_into(xs[2], q2, &mut s2, &mut b2);
+        let z3 = quantize_q8_blocks_into(xs[3], q3, &mut s3, &mut b3);
+
+        f(
+            [q0, q1, q2, q3],
+            [&s0, &s1, &s2, &s3],
+            [&b0, &b1, &b2, &b3],
+            [z0, z1, z2, z3],
+        )
     }
 }
 
@@ -1000,6 +1200,63 @@ mod tests {
             .max_by(|&a, &b| full[a].total_cmp(&full[b]).then_with(|| b.cmp(&a)))
             .ok_or("non-empty subset")?;
         assert_eq!(usize::try_from(winner)?, expected_winner);
+        Ok(())
+    }
+
+    #[test]
+    fn matmul4_matches_four_matvecs_for_w8_and_q4() -> Result<(), Box<dyn std::error::Error>> {
+        let out_dim = 512;
+        let in_dim = 768;
+        let mut w = Vec::with_capacity(out_dim * in_dim);
+        for r in 0..out_dim {
+            for c in 0..in_dim {
+                w.push((((r * 23 + c * 11) % 79) as f32 - 39.0) * 0.012);
+            }
+        }
+        let xs: Vec<Vec<f32>> = (0..4)
+            .map(|k| {
+                (0..in_dim)
+                    .map(|i| (((i * (17 + k * 5) + k * 13) % 53) as f32 - 26.0) * 0.04)
+                    .collect()
+            })
+            .collect();
+
+        for format in [QuantFormat::W8, QuantFormat::Q4] {
+            let mat = QuantizedMatrix::from_f32_with_format(&w, out_dim, in_dim, format)?;
+
+            let mut ref_outs = vec![vec![0.0_f32; out_dim]; 4];
+            let mut q_single = vec![0_i8; in_dim];
+            for k in 0..4 {
+                mat.matvec_into(&xs[k], &mut q_single, &mut ref_outs[k]);
+            }
+
+            let mut q0 = vec![0_i8; in_dim];
+            let mut q1 = vec![0_i8; in_dim];
+            let mut q2 = vec![0_i8; in_dim];
+            let mut q3 = vec![0_i8; in_dim];
+            let mut o0 = vec![0.0_f32; out_dim];
+            let mut o1 = vec![0.0_f32; out_dim];
+            let mut o2 = vec![0.0_f32; out_dim];
+            let mut o3 = vec![0.0_f32; out_dim];
+
+            mat.matmul4_into(
+                [&xs[0], &xs[1], &xs[2], &xs[3]],
+                [&mut q0, &mut q1, &mut q2, &mut q3],
+                [&mut o0, &mut o1, &mut o2, &mut o3],
+            );
+
+            for (k, got) in [&o0, &o1, &o2, &o3].iter().enumerate() {
+                for row in 0..out_dim {
+                    let diff = (got[row] - ref_outs[k][row]).abs();
+                    assert!(
+                        diff < 1e-4,
+                        "{format:?} k={k} row={row}: got={} vs ref={} (diff={diff})",
+                        got[row],
+                        ref_outs[k][row]
+                    );
+                }
+            }
+        }
         Ok(())
     }
 }

@@ -226,6 +226,466 @@ pub fn compute_q4_row_range(
     }
 }
 
+/// Produto escalar Q4 × Q8 simultâneo para **4 vetores de entrada** lendo a linha de pesos
+/// (e descompactando nibbles + escala `f16`) **uma única vez**.
+#[inline]
+#[must_use]
+pub fn dot_q4_row_x4(
+    row_blocks: &[Q4Block],
+    qx: [&[i8]; 4],
+    x_scales: [&[f32]; 4],
+    x_bias: [&[f32]; 4],
+    in_dim: usize,
+) -> [f32; 4] {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma")
+            && std::arch::is_x86_feature_detected!("f16c")
+        {
+            // SAFETY: AVX2, FMA e F16C verificados em runtime acima.
+            return unsafe { dot_q4_row_x4_avx2(row_blocks, qx, x_scales, x_bias, in_dim) };
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON é obrigatório na arquitetura base aarch64.
+        return unsafe { dot_q4_row_x4_neon(row_blocks, qx, x_scales, x_bias, in_dim) };
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    dot_q4_row_x4_scalar(row_blocks, qx, x_scales, x_bias, in_dim)
+}
+
+/// Calcula uma faixa contígua de linhas Q4 contra **4 vetores em paralelo** (`M × 4`),
+/// lendo os pesos da RAM uma única vez por faixa e aplicando `PREFETCHNTA` quando `use_nta = true`.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_q4_row_range_x4(
+    blocks: &[Q4Block],
+    blocks_per_row: usize,
+    row0: usize,
+    out_slices: [&mut [f32]; 4],
+    qx: [&[i8]; 4],
+    x_scales: [&[f32]; 4],
+    x_bias: [&[f32]; 4],
+    in_dim: usize,
+    use_nta: bool,
+) {
+    let count = out_slices[0].len();
+    assert!(out_slices.iter().all(|s| s.len() == count));
+    assert!(blocks_per_row >= in_dim.div_ceil(Q4_BLOCK_SIZE));
+    assert!(qx.iter().all(|q| q.len() >= in_dim));
+    assert!(x_scales.iter().all(|s| s.len() >= blocks_per_row));
+    assert!(x_bias.iter().all(|b| b.len() >= blocks_per_row));
+    assert!(
+        row0.saturating_add(count).saturating_mul(blocks_per_row) <= blocks.len()
+    );
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma")
+            && std::arch::is_x86_feature_detected!("f16c")
+        {
+            // SAFETY: AVX2, FMA e F16C verificados em runtime e limites validados acima.
+            unsafe {
+                compute_q4_row_range_x4_avx2(
+                    blocks,
+                    blocks_per_row,
+                    row0,
+                    out_slices,
+                    qx,
+                    x_scales,
+                    x_bias,
+                    in_dim,
+                    use_nta,
+                );
+            }
+            return;
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = use_nta;
+        let [o0, o1, o2, o3] = out_slices;
+        for i in 0..count {
+            let row = row0 + i;
+            let row_blocks = &blocks[row * blocks_per_row..(row + 1) * blocks_per_row];
+            // SAFETY: NEON é padrão em aarch64 e limites foram validados acima.
+            let vals = unsafe { dot_q4_row_x4_neon(row_blocks, qx, x_scales, x_bias, in_dim) };
+            o0[i] = vals[0];
+            o1[i] = vals[1];
+            o2[i] = vals[2];
+            o3[i] = vals[3];
+        }
+        return;
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = use_nta;
+        let [o0, o1, o2, o3] = out_slices;
+        for i in 0..count {
+            let row = row0 + i;
+            let row_blocks = &blocks[row * blocks_per_row..(row + 1) * blocks_per_row];
+            let vals = dot_q4_row_x4_scalar(row_blocks, qx, x_scales, x_bias, in_dim);
+            o0[i] = vals[0];
+            o1[i] = vals[1];
+            o2[i] = vals[2];
+            o3[i] = vals[3];
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn compute_q4_row_range_x4_avx2(
+    blocks: &[Q4Block],
+    blocks_per_row: usize,
+    row0: usize,
+    out_slices: [&mut [f32]; 4],
+    qx: [&[i8]; 4],
+    x_scales: [&[f32]; 4],
+    x_bias: [&[f32]; 4],
+    in_dim: usize,
+    use_nta: bool,
+) {
+    use std::arch::x86_64::{_MM_HINT_NTA, _mm_prefetch};
+
+    let [o0, o1, o2, o3] = out_slices;
+    let count = o0.len();
+    for i in 0..count {
+        let row = row0 + i;
+        if use_nta && i + 1 < count {
+            let next_row = &blocks[(row + 1) * blocks_per_row..(row + 2) * blocks_per_row];
+            let p0 = next_row.as_ptr().cast::<i8>();
+            // SAFETY: `p0` aponta para dentro de `blocks`; `_mm_prefetch` é apenas hint de cache.
+            unsafe {
+                _mm_prefetch::<_MM_HINT_NTA>(p0);
+                if blocks_per_row >= 8 {
+                    _mm_prefetch::<_MM_HINT_NTA>(p0.add(256));
+                }
+            }
+        }
+        let row_blocks = &blocks[row * blocks_per_row..(row + 1) * blocks_per_row];
+        // SAFETY: `#[target_feature]` ativo e limites validados pelo chamador.
+        let vals = unsafe { dot_q4_row_x4_avx2(row_blocks, qx, x_scales, x_bias, in_dim) };
+        o0[i] = vals[0];
+        o1[i] = vals[1];
+        o2[i] = vals[2];
+        o3[i] = vals[3];
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn hsum256_ps(v: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::{
+        _mm_add_ps, _mm_add_ss, _mm_cvtss_f32, _mm_movehdup_ps, _mm_movehl_ps,
+        _mm256_castps256_ps128, _mm256_extractf128_ps,
+    };
+    let hi128 = _mm256_extractf128_ps(v, 1);
+    let lo128 = _mm256_castps256_ps128(v);
+    let sum128 = _mm_add_ps(lo128, hi128);
+    let shuf = _mm_movehdup_ps(sum128);
+    let sums = _mm_add_ps(sum128, shuf);
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
+}
+
+/// Kernel AVX2 + FMA + F16C para `M × 4`:
+/// descompacta cada `Q4Block` 1 única vez e satura 4 acumuladores YMM independentes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+unsafe fn dot_q4_row_x4_avx2(
+    blocks: &[Q4Block],
+    qx: [&[i8]; 4],
+    x_scales: [&[f32]; 4],
+    x_bias: [&[f32]; 4],
+    in_dim: usize,
+) -> [f32; 4] {
+    use std::arch::x86_64::{
+        __m128i, __m256i, _mm_and_si128, _mm_cvtph_ps, _mm_cvtsi32_si128, _mm_cvtss_f32,
+        _mm_loadu_si128, _mm_set1_epi8, _mm_srli_epi16, _mm256_cvtepi32_ps, _mm256_fmadd_ps,
+        _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_set_m128i,
+        _mm256_set1_epi16, _mm256_set1_ps, _mm256_setzero_ps,
+    };
+
+    let full_blocks = in_dim / Q4_BLOCK_SIZE;
+    let rem = in_dim % Q4_BLOCK_SIZE;
+
+    // SAFETY: AVX2/FMA/F16C ativos pelo `#[target_feature]`; limites garantidos pelo chamador.
+    unsafe {
+        let mask_0f = _mm_set1_epi8(0x0F);
+        let ones_16 = _mm256_set1_epi16(1);
+
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
+        let mut b0 = 0.0_f32;
+        let mut b1 = 0.0_f32;
+        let mut b2 = 0.0_f32;
+        let mut b3 = 0.0_f32;
+
+        let p0 = qx[0].as_ptr();
+        let p1 = qx[1].as_ptr();
+        let p2 = qx[2].as_ptr();
+        let p3 = qx[3].as_ptr();
+
+        for b in 0..full_blocks {
+            let blk = blocks.get_unchecked(b);
+            let ws = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(i32::from(blk.scale_f16))));
+
+            // Descompactação 1x compartilhada pelos 4 vetores de entrada
+            let raw = _mm_loadu_si128(blk.qs.as_ptr().cast::<__m128i>());
+            let w_u4 = _mm256_set_m128i(
+                _mm_and_si128(_mm_srli_epi16(raw, 4), mask_0f),
+                _mm_and_si128(raw, mask_0f),
+            );
+
+            let off = b * Q4_BLOCK_SIZE;
+
+            let q0 = _mm256_loadu_si256(p0.add(off).cast::<__m256i>());
+            let prod0 =
+                _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(w_u4, q0), ones_16));
+            acc0 = _mm256_fmadd_ps(prod0, _mm256_set1_ps(ws * *x_scales[0].get_unchecked(b)), acc0);
+            b0 = ws.mul_add(*x_bias[0].get_unchecked(b), b0);
+
+            let q1 = _mm256_loadu_si256(p1.add(off).cast::<__m256i>());
+            let prod1 =
+                _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(w_u4, q1), ones_16));
+            acc1 = _mm256_fmadd_ps(prod1, _mm256_set1_ps(ws * *x_scales[1].get_unchecked(b)), acc1);
+            b1 = ws.mul_add(*x_bias[1].get_unchecked(b), b1);
+
+            let q2 = _mm256_loadu_si256(p2.add(off).cast::<__m256i>());
+            let prod2 =
+                _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(w_u4, q2), ones_16));
+            acc2 = _mm256_fmadd_ps(prod2, _mm256_set1_ps(ws * *x_scales[2].get_unchecked(b)), acc2);
+            b2 = ws.mul_add(*x_bias[2].get_unchecked(b), b2);
+
+            let q3 = _mm256_loadu_si256(p3.add(off).cast::<__m256i>());
+            let prod3 =
+                _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(w_u4, q3), ones_16));
+            acc3 = _mm256_fmadd_ps(prod3, _mm256_set1_ps(ws * *x_scales[3].get_unchecked(b)), acc3);
+            b3 = ws.mul_add(*x_bias[3].get_unchecked(b), b3);
+        }
+
+        if rem > 0 {
+            let b_tail = full_blocks;
+            let blk = blocks.get_unchecked(b_tail);
+            let ws = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(i32::from(blk.scale_f16))));
+            let raw = _mm_loadu_si128(blk.qs.as_ptr().cast::<__m128i>());
+            let w_u4 = _mm256_set_m128i(
+                _mm_and_si128(_mm_srli_epi16(raw, 4), mask_0f),
+                _mm_and_si128(raw, mask_0f),
+            );
+
+            let mut t0 = [0_i8; Q4_BLOCK_SIZE];
+            let mut t1 = [0_i8; Q4_BLOCK_SIZE];
+            let mut t2 = [0_i8; Q4_BLOCK_SIZE];
+            let mut t3 = [0_i8; Q4_BLOCK_SIZE];
+            let base = b_tail * Q4_BLOCK_SIZE;
+            t0[..rem].copy_from_slice(&qx[0][base..in_dim]);
+            t1[..rem].copy_from_slice(&qx[1][base..in_dim]);
+            t2[..rem].copy_from_slice(&qx[2][base..in_dim]);
+            t3[..rem].copy_from_slice(&qx[3][base..in_dim]);
+
+            let prod0 = _mm256_cvtepi32_ps(_mm256_madd_epi16(
+                _mm256_maddubs_epi16(w_u4, _mm256_loadu_si256(t0.as_ptr().cast::<__m256i>())),
+                ones_16,
+            ));
+            acc0 = _mm256_fmadd_ps(prod0, _mm256_set1_ps(ws * *x_scales[0].get_unchecked(b_tail)), acc0);
+            b0 = ws.mul_add(*x_bias[0].get_unchecked(b_tail), b0);
+
+            let prod1 = _mm256_cvtepi32_ps(_mm256_madd_epi16(
+                _mm256_maddubs_epi16(w_u4, _mm256_loadu_si256(t1.as_ptr().cast::<__m256i>())),
+                ones_16,
+            ));
+            acc1 = _mm256_fmadd_ps(prod1, _mm256_set1_ps(ws * *x_scales[1].get_unchecked(b_tail)), acc1);
+            b1 = ws.mul_add(*x_bias[1].get_unchecked(b_tail), b1);
+
+            let prod2 = _mm256_cvtepi32_ps(_mm256_madd_epi16(
+                _mm256_maddubs_epi16(w_u4, _mm256_loadu_si256(t2.as_ptr().cast::<__m256i>())),
+                ones_16,
+            ));
+            acc2 = _mm256_fmadd_ps(prod2, _mm256_set1_ps(ws * *x_scales[2].get_unchecked(b_tail)), acc2);
+            b2 = ws.mul_add(*x_bias[2].get_unchecked(b_tail), b2);
+
+            let prod3 = _mm256_cvtepi32_ps(_mm256_madd_epi16(
+                _mm256_maddubs_epi16(w_u4, _mm256_loadu_si256(t3.as_ptr().cast::<__m256i>())),
+                ones_16,
+            ));
+            acc3 = _mm256_fmadd_ps(prod3, _mm256_set1_ps(ws * *x_scales[3].get_unchecked(b_tail)), acc3);
+            b3 = ws.mul_add(*x_bias[3].get_unchecked(b_tail), b3);
+        }
+
+        [
+            hsum256_ps(acc0) + b0,
+            hsum256_ps(acc1) + b1,
+            hsum256_ps(acc2) + b2,
+            hsum256_ps(acc3) + b3,
+        ]
+    }
+}
+
+/// Kernel ARM64 NEON para `M × 4` (Raspberry Pi 4 / Pi 5): descompacta cada `Q4Block` 1×.
+#[cfg(target_arch = "aarch64")]
+unsafe fn dot_q4_row_x4_neon(
+    blocks: &[Q4Block],
+    qx: [&[i8]; 4],
+    x_scales: [&[f32]; 4],
+    x_bias: [&[f32]; 4],
+    in_dim: usize,
+) -> [f32; 4] {
+    use core::arch::aarch64::{
+        vaddlvq_s16, vandq_u8, vdupq_n_u8, vget_high_s8, vget_low_s8, vld1q_s8, vld1q_u8, vmlal_s8,
+        vmull_s8, vreinterpretq_s8_u8, vshrq_n_u8,
+    };
+
+    let full_blocks = in_dim / Q4_BLOCK_SIZE;
+    let rem = in_dim % Q4_BLOCK_SIZE;
+    let mut totals = [0.0_f32; 4];
+
+    // SAFETY: NEON é baseline em aarch64 e os offsets são limitados por `full_blocks` e `rem`.
+    unsafe {
+        let mask_0f = vdupq_n_u8(0x0F);
+
+        for b in 0..full_blocks {
+            let blk = blocks.get_unchecked(b);
+            let w_scale = f16_to_f32_scalar(blk.scale_f16);
+            if w_scale == 0.0 {
+                continue;
+            }
+            let raw = vld1q_u8(blk.qs.as_ptr());
+            let lo_s8 = vreinterpretq_s8_u8(vandq_u8(raw, mask_0f));
+            let hi_s8 = vreinterpretq_s8_u8(vshrq_n_u8::<4>(raw));
+            let lo_l = vget_low_s8(lo_s8);
+            let lo_h = vget_high_s8(lo_s8);
+            let hi_l = vget_low_s8(hi_s8);
+            let hi_h = vget_high_s8(hi_s8);
+
+            let off = b * Q4_BLOCK_SIZE;
+            for k in 0..4 {
+                let xs = *x_scales[k].get_unchecked(b);
+                if xs == 0.0 {
+                    continue;
+                }
+                let qptr = qx[k].as_ptr().add(off);
+                let qlo = vld1q_s8(qptr);
+                let qhi = vld1q_s8(qptr.add(Q4_BLOCK_SIZE / 2));
+
+                let mut acc16 = vmull_s8(lo_l, vget_low_s8(qlo));
+                acc16 = vmlal_s8(acc16, lo_h, vget_high_s8(qlo));
+                acc16 = vmlal_s8(acc16, hi_l, vget_low_s8(qhi));
+                acc16 = vmlal_s8(acc16, hi_h, vget_high_s8(qhi));
+
+                let acc = vaddlvq_s16(acc16);
+                totals[k] = (acc as f32).mul_add(
+                    w_scale * xs,
+                    w_scale.mul_add(*x_bias[k].get_unchecked(b), totals[k]),
+                );
+            }
+        }
+
+        if rem > 0 {
+            let b = full_blocks;
+            let blk = blocks.get_unchecked(b);
+            let w_scale = f16_to_f32_scalar(blk.scale_f16);
+            if w_scale != 0.0 {
+                let raw = vld1q_u8(blk.qs.as_ptr());
+                let lo_s8 = vreinterpretq_s8_u8(vandq_u8(raw, mask_0f));
+                let hi_s8 = vreinterpretq_s8_u8(vshrq_n_u8::<4>(raw));
+                let lo_l = vget_low_s8(lo_s8);
+                let lo_h = vget_high_s8(lo_s8);
+                let hi_l = vget_low_s8(hi_s8);
+                let hi_h = vget_high_s8(hi_s8);
+                let base = b * Q4_BLOCK_SIZE;
+
+                for k in 0..4 {
+                    let xs = *x_scales[k].get_unchecked(b);
+                    if xs == 0.0 {
+                        continue;
+                    }
+                    let mut tail = [0_i8; Q4_BLOCK_SIZE];
+                    tail[..rem].copy_from_slice(&qx[k][base..in_dim]);
+                    let qlo = vld1q_s8(tail.as_ptr());
+                    let qhi = vld1q_s8(tail.as_ptr().add(Q4_BLOCK_SIZE / 2));
+
+                    let mut acc16 = vmull_s8(lo_l, vget_low_s8(qlo));
+                    acc16 = vmlal_s8(acc16, lo_h, vget_high_s8(qlo));
+                    acc16 = vmlal_s8(acc16, hi_l, vget_low_s8(qhi));
+                    acc16 = vmlal_s8(acc16, hi_h, vget_high_s8(qhi));
+
+                    let acc = vaddlvq_s16(acc16);
+                    totals[k] = (acc as f32).mul_add(
+                        w_scale * xs,
+                        w_scale.mul_add(*x_bias[k].get_unchecked(b), totals[k]),
+                    );
+                }
+            }
+        }
+    }
+
+    totals
+}
+
+/// Referência escalar `M × 4` (lê cada bloco uma única vez para os 4 vetores).
+#[must_use]
+pub fn dot_q4_row_x4_scalar(
+    blocks: &[Q4Block],
+    qx: [&[i8]; 4],
+    x_scales: [&[f32]; 4],
+    x_bias: [&[f32]; 4],
+    in_dim: usize,
+) -> [f32; 4] {
+    let half = Q4_BLOCK_SIZE / 2;
+    let mut totals = [0.0_f32; 4];
+
+    for (b, blk) in blocks.iter().enumerate() {
+        let w_scale = f16_to_f32_scalar(blk.scale_f16);
+        if w_scale == 0.0 {
+            continue;
+        }
+        let base = b * Q4_BLOCK_SIZE;
+        let end = (base + Q4_BLOCK_SIZE).min(in_dim);
+        let mut accs = [0_i32; 4];
+
+        for (j, &packed) in blk.qs.iter().enumerate() {
+            let lo = i32::from(packed & 0x0F);
+            let hi = i32::from(packed >> 4);
+            let idx0 = base + j;
+            let idx1 = base + j + half;
+            if idx0 < end {
+                for k in 0..4 {
+                    accs[k] += lo * i32::from(qx[k][idx0]);
+                }
+            }
+            if idx1 < end {
+                for k in 0..4 {
+                    accs[k] += hi * i32::from(qx[k][idx1]);
+                }
+            }
+        }
+
+        for k in 0..4 {
+            let combined = w_scale * x_scales[k][b];
+            if combined != 0.0 {
+                totals[k] = (accs[k] as f32).mul_add(
+                    combined,
+                    w_scale.mul_add(x_bias[k][b], totals[k]),
+                );
+            }
+        }
+    }
+
+    totals
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 #[allow(clippy::too_many_arguments)]
@@ -565,6 +1025,90 @@ mod tests {
                     (single - expected).abs() < 1e-3,
                     "single in_dim={in_dim} r={r}: got={single} vs expected={expected}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn simd_q4_x4_matches_single_row_and_scalar() {
+        for in_dim in [1_usize, 15, 32, 33, 96, 768] {
+            let n_blk = in_dim.div_ceil(Q4_BLOCK_SIZE);
+            let rows = 5;
+            let mut blocks = Vec::with_capacity(rows * n_blk);
+            for r in 0..rows {
+                for b in 0..n_blk {
+                    let mut qs = [0_u8; 16];
+                    for (j, slot) in qs.iter_mut().enumerate() {
+                        let lo = ((r * 7 + b * 3 + j) % 16) as u8;
+                        let hi = ((r * 5 + b * 11 + j * 3) % 16) as u8;
+                        *slot = lo | (hi << 4);
+                    }
+                    blocks.push(Q4Block {
+                        scale_f16: f32_to_f16(0.02 + ((r + b) % 7) as f32 * 0.01),
+                        qs,
+                    });
+                }
+            }
+
+            let qx_vecs: Vec<Vec<i8>> = (0..4)
+                .map(|k| {
+                    (0..in_dim)
+                        .map(|i| (((i * (31 + k * 7) + k * 19 + 5) % 255) as i32 - 127) as i8)
+                        .collect()
+                })
+                .collect();
+            let xs_vecs: Vec<Vec<f32>> = (0..4)
+                .map(|k| {
+                    (0..n_blk)
+                        .map(|b| 0.01 + ((b + k) % 5) as f32 * 0.004)
+                        .collect()
+                })
+                .collect();
+            let xb_vecs: Vec<Vec<f32>> = (0..4)
+                .map(|k| {
+                    (0..n_blk)
+                        .map(|b| {
+                            let s = b * Q4_BLOCK_SIZE;
+                            let e = (s + Q4_BLOCK_SIZE).min(in_dim);
+                            let sum: i32 = qx_vecs[k][s..e].iter().map(|&v| i32::from(v)).sum();
+                            -8.0 * xs_vecs[k][b] * (sum as f32)
+                        })
+                        .collect()
+                })
+                .collect();
+
+            let qx = [&qx_vecs[0][..], &qx_vecs[1][..], &qx_vecs[2][..], &qx_vecs[3][..]];
+            let xs = [&xs_vecs[0][..], &xs_vecs[1][..], &xs_vecs[2][..], &xs_vecs[3][..]];
+            let xb = [&xb_vecs[0][..], &xb_vecs[1][..], &xb_vecs[2][..], &xb_vecs[3][..]];
+
+            let mut o0 = vec![0.0_f32; rows];
+            let mut o1 = vec![0.0_f32; rows];
+            let mut o2 = vec![0.0_f32; rows];
+            let mut o3 = vec![0.0_f32; rows];
+            compute_q4_row_range_x4(
+                &blocks,
+                n_blk,
+                0,
+                [&mut o0, &mut o1, &mut o2, &mut o3],
+                qx,
+                xs,
+                xb,
+                in_dim,
+                true,
+            );
+
+            for r in 0..rows {
+                let row_blocks = &blocks[r * n_blk..(r + 1) * n_blk];
+                let expected = dot_q4_row_x4_scalar(row_blocks, qx, xs, xb, in_dim);
+                let got = [o0[r], o1[r], o2[r], o3[r]];
+                for k in 0..4 {
+                    assert!(
+                        (got[k] - expected[k]).abs() < 1e-3,
+                        "in_dim={in_dim} r={r} k={k}: got={} vs expected={}",
+                        got[k],
+                        expected[k]
+                    );
+                }
             }
         }
     }
