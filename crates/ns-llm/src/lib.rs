@@ -27,7 +27,8 @@ pub use chat::{ChatSamplingConfig, ChatTurnStats};
 
 #[cfg(feature = "custom-rwkv")]
 pub use rwkv7::{
-    Rwkv7ChatSession, Rwkv7Config, Rwkv7Llm, Rwkv7State, SparseColQuantizedMatrix, load_vocab_trie,
+    PrefixCacheStats, Rwkv7ChatSession, Rwkv7Config, Rwkv7Llm, Rwkv7State,
+    SparseColQuantizedMatrix, load_vocab_trie,
 };
 #[cfg(feature = "custom-rwkv")]
 pub use sparse_moe::{MoeStepStats, SparseExpert, SparseMoeFfn, SparseMoeScratch};

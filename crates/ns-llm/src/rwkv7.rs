@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use llguidance::api::TopLevelGrammar;
@@ -891,6 +891,40 @@ impl Rwkv7Scratch {
     }
 }
 
+/// Métricas observáveis do reuso de estado recorrente O(1) entre turnos do [`Rwkv7Llm`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrefixCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub tokens_reused: u64,
+    pub tokens_prefilled: u64,
+}
+
+#[derive(Debug, Default)]
+struct PrefixStateCache {
+    tokens: Vec<TokenId>,
+    layers_snapshot: Option<Box<[Rwkv7LayerState]>>,
+    h_prefill: Vec<f32>,
+    token_byte_ends: Vec<usize>,
+    checkpoint_x_out: Vec<f32>,
+    copy_keys: Vec<f32>,
+    copy_tokens: Vec<TokenId>,
+    working_state: Option<Rwkv7State>,
+    stats: PrefixCacheStats,
+}
+
+fn copy_layers(dst: &mut [Rwkv7LayerState], src: &[Rwkv7LayerState]) {
+    for (d_layer, s_layer) in dst.iter_mut().zip(src.iter()) {
+        d_layer.prev_x_tm.copy_from_slice(&s_layer.prev_x_tm);
+        d_layer.prev_x_cm.copy_from_slice(&s_layer.prev_x_cm);
+        d_layer.state_mat.copy_from_slice(&s_layer.state_mat);
+    }
+}
+
+fn common_prefix_len(a: &[TokenId], b: &[TokenId]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
 /// Estado recorrente estritamente O(1) do RWKV-v7 (zero KV-Cache, zero alocações no decode).
 #[derive(Debug, Clone)]
 pub struct Rwkv7State {
@@ -955,6 +989,21 @@ impl Rwkv7State {
         }
         1.0 - (self.read_ffn_bytes as f64) / (self.total_ffn_bytes as f64)
     }
+
+    /// Zera apenas os estados recorrentes e contadores, preservando as alocações de `layers` e `scratch`.
+    pub fn reset_recurrent_zero(&mut self) {
+        for layer in self.layers.iter_mut() {
+            layer.prev_x_tm.fill(0.0);
+            layer.prev_x_cm.fill(0.0);
+            layer.state_mat.fill(0.0);
+        }
+        self.scratch.copy_keys.clear();
+        self.scratch.copy_tokens.clear();
+        self.total_ffn_cols = 0;
+        self.active_ffn_cols = 0;
+        self.total_ffn_bytes = 0;
+        self.read_ffn_bytes = 0;
+    }
 }
 
 /// Motor nativo RWKV-v7 ("Goose") em Rust puro com W8A8, pulo de zeros `ReLU²`,
@@ -974,6 +1023,7 @@ pub struct Rwkv7Llm {
     decode_mode: DecodeMode,
     isa_head: Option<IsaHeadWeights>,
     max_new_tokens: usize,
+    prefix_cache: Mutex<PrefixStateCache>,
 }
 
 impl std::fmt::Debug for Rwkv7Llm {
@@ -1225,6 +1275,7 @@ impl Rwkv7Llm {
             decode_mode: DecodeMode::Auto,
             isa_head,
             max_new_tokens: 256,
+            prefix_cache: Mutex::new(PrefixStateCache::default()),
         };
 
         tracing::info!(
@@ -1645,10 +1696,11 @@ impl Rwkv7Llm {
             let tok = scratch.copy_tokens[slot];
             if mask.is_allowed(tok)
                 && let Ok(idx) = usize::try_from(tok)
-                && let Some(acc) = scratch.copy_vocab_acc.get_mut(idx) {
-                    *acc += weight;
-                    any_allowed_copy = true;
-                }
+                && let Some(acc) = scratch.copy_vocab_acc.get_mut(idx)
+            {
+                *acc += weight;
+                any_allowed_copy = true;
+            }
         }
 
         let d_model = self.cfg.d_model;
@@ -1712,9 +1764,10 @@ impl Rwkv7Llm {
 
         for &tok in &scratch.copy_tokens {
             if let Ok(idx) = usize::try_from(tok)
-                && let Some(acc) = scratch.copy_vocab_acc.get_mut(idx) {
-                    *acc = 0.0;
-                }
+                && let Some(acc) = scratch.copy_vocab_acc.get_mut(idx)
+            {
+                *acc = 0.0;
+            }
         }
 
         best_row
@@ -1722,38 +1775,141 @@ impl Rwkv7Llm {
             .map(|tok| (tok, eff_copy))
     }
 
-    /// Gera uma [`LlmAction`] 100% aderente ao JSON Schema usando o RWKV-7 G1 + `llguidance`.
+    /// Gera uma [`LlmAction`] 100% aderente ao JSON Schema usando o RWKV-7 G1 + `llguidance`,
+    /// reutilizando o estado recorrente O(1) do prefixo entre turnos do `Orchestrator`.
     ///
     /// # Errors
     ///
     /// Retorna [`LlmError`] se a inferência, a gramática ou a desserialização JSON falharem.
     pub fn generate_action_from_prompt(&self, prompt: &str) -> Result<LlmAction, LlmError> {
-        let formatted = format!("{}\nAssistant:", prompt.trim());
+        let trimmed = prompt.trim();
+        let formatted = format!("{trimmed}\nAssistant:");
         let prompt_ids = self.tok_trie.greedy_tokenize(formatted.as_bytes());
-
-        let mut state = Rwkv7State::new(&self.cfg);
+        let base_ids = self.tok_trie.greedy_tokenize(trimmed.as_bytes());
+        let checkpoint_len = common_prefix_len(&base_ids, &prompt_ids);
         let record_from = prompt_ids.len().saturating_sub(self.cfg.copy_max_len);
 
-        // Regra oficial do RWKV-7 G1: sempre começar com o token 0 (EOS/BOS) para ancorar o estado
-        self.forward_hidden(self.cfg.bos_token_id, &mut state)?;
-        if record_from == 0
-            && let Some(&first_tok) = prompt_ids.first()
-        {
-            self.record_copy_entry(&mut state, first_tok);
-        }
+        let mut cache = self
+            .prefix_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = cache
+            .working_state
+            .take()
+            .unwrap_or_else(|| Rwkv7State::new(&self.cfg));
 
-        for (idx, &tok_id) in prompt_ids.iter().enumerate() {
-            let id = usize::try_from(tok_id)
-                .map_err(|_| LlmError::Inference("token id conversion overflow".to_owned()))?;
-            self.forward_hidden(id, &mut state)?;
+        let copy_ok = self.copy_gate.is_none()
+            || (record_from == 0
+                && cache.copy_tokens.len() == cache.tokens.len()
+                && cache.checkpoint_x_out.len() == self.cfg.d_model);
+        let cache_hit = !cache.tokens.is_empty()
+            && cache.layers_snapshot.is_some()
+            && copy_ok
+            && prompt_ids.starts_with(&cache.tokens);
+
+        let reuse_len = if cache_hit {
+            let n = cache.tokens.len();
+            if let Some(ref snap) = cache.layers_snapshot {
+                copy_layers(&mut state.layers, snap);
+            }
+            state.total_ffn_cols = 0;
+            state.active_ffn_cols = 0;
+            state.total_ffn_bytes = 0;
+            state.read_ffn_bytes = 0;
+            state.scratch.copy_keys.clear();
+            state.scratch.copy_tokens.clear();
+            if self.copy_gate.is_some() {
+                state.scratch.copy_keys.extend_from_slice(&cache.copy_keys);
+                state
+                    .scratch
+                    .copy_tokens
+                    .extend_from_slice(&cache.copy_tokens);
+                state.scratch.x_out.copy_from_slice(&cache.checkpoint_x_out);
+                if let Some(&next_tok) = prompt_ids.get(n) {
+                    self.record_copy_entry(&mut state, next_tok);
+                }
+            }
+            cache.stats.hits = cache.stats.hits.saturating_add(1);
+            cache.stats.tokens_reused = cache.stats.tokens_reused.saturating_add(n as u64);
+            n
+        } else {
+            state.reset_recurrent_zero();
+            if let Err(err) = self.forward_hidden(self.cfg.bos_token_id, &mut state) {
+                cache.working_state = Some(state);
+                return Err(err);
+            }
+            if record_from == 0
+                && let Some(&first_tok) = prompt_ids.first()
+            {
+                self.record_copy_entry(&mut state, first_tok);
+            }
+            cache.stats.misses = cache.stats.misses.saturating_add(1);
+            0
+        };
+
+        let delta_len = prompt_ids.len().saturating_sub(reuse_len);
+        for (offset, &tok_id) in prompt_ids[reuse_len..].iter().enumerate() {
+            let idx = reuse_len + offset;
+            let Ok(id) = usize::try_from(tok_id) else {
+                cache.working_state = Some(state);
+                return Err(LlmError::Inference(
+                    "token id conversion overflow".to_owned(),
+                ));
+            };
+            if let Err(err) = self.forward_hidden(id, &mut state) {
+                cache.working_state = Some(state);
+                return Err(err);
+            }
+
+            if idx + 1 == checkpoint_len && checkpoint_len > reuse_len {
+                cache.tokens.clear();
+                cache
+                    .tokens
+                    .extend_from_slice(&prompt_ids[..checkpoint_len]);
+                match cache.layers_snapshot {
+                    Some(ref mut snap) => copy_layers(snap, &state.layers),
+                    None => cache.layers_snapshot = Some(state.layers.clone()),
+                }
+                cache.h_prefill.clear();
+                cache.token_byte_ends.clear();
+                cache.checkpoint_x_out.clear();
+                cache.copy_keys.clear();
+                cache.copy_tokens.clear();
+                if self.copy_gate.is_some() && record_from == 0 {
+                    cache
+                        .checkpoint_x_out
+                        .extend_from_slice(&state.scratch.x_out);
+                    cache.copy_keys.extend_from_slice(&state.scratch.copy_keys);
+                    cache
+                        .copy_tokens
+                        .extend_from_slice(&state.scratch.copy_tokens);
+                }
+            }
 
             let next_idx = idx.saturating_add(1);
             if next_idx >= record_from
-                && let Some(&next_tok) = prompt_ids.get(next_idx) {
-                    self.record_copy_entry(&mut state, next_tok);
-                }
+                && let Some(&next_tok) = prompt_ids.get(next_idx)
+            {
+                self.record_copy_entry(&mut state, next_tok);
+            }
         }
+        cache.stats.tokens_prefilled = cache
+            .stats
+            .tokens_prefilled
+            .saturating_add(delta_len as u64);
 
+        let result = self.decode_json_after_prefill(&mut state, cache_hit, reuse_len, delta_len);
+        cache.working_state = Some(state);
+        result
+    }
+
+    fn decode_json_after_prefill(
+        &self,
+        state: &mut Rwkv7State,
+        cache_hit: bool,
+        reused_tokens: usize,
+        prefilled_tokens: usize,
+    ) -> Result<LlmAction, LlmError> {
         let mut matcher = Matcher::new(self.parser_factory.create_parser(self.grammar.clone()));
         if let Some(err) = matcher.get_error() {
             return Err(LlmError::GrammarInit(err));
@@ -1768,11 +1924,9 @@ impl Rwkv7Llm {
                 .compute_mask()
                 .map_err(|err| LlmError::GrammarInit(err.to_string()))?;
 
-            let (next_tok, p_copy) =
-                self.sample_with_copy_gate(&mut state, &mask)
-                    .ok_or_else(|| {
-                        LlmError::GrammarInit("llguidance mask allowed zero tokens".to_owned())
-                    })?;
+            let (next_tok, p_copy) = self.sample_with_copy_gate(state, &mask).ok_or_else(|| {
+                LlmError::GrammarInit("llguidance mask allowed zero tokens".to_owned())
+            })?;
 
             tracing::trace!(next_tok, p_copy, "rwkv7 sampled token");
 
@@ -1788,7 +1942,7 @@ impl Rwkv7Llm {
             let next_usize = usize::try_from(next_tok).map_err(|_| {
                 LlmError::Inference("generated token conversion overflow".to_owned())
             })?;
-            self.forward_hidden(next_usize, &mut state)?;
+            self.forward_hidden(next_usize, state)?;
 
             for ff_tok in matcher.consume_ff_tokens() {
                 if ff_tok == eos_u32 || generated_ids.len() >= self.max_new_tokens {
@@ -1798,12 +1952,15 @@ impl Rwkv7Llm {
                 let ff_usize = usize::try_from(ff_tok).map_err(|_| {
                     LlmError::Inference("fast-forward token conversion overflow".to_owned())
                 })?;
-                self.forward_hidden(ff_usize, &mut state)?;
+                self.forward_hidden(ff_usize, state)?;
             }
         }
 
         let raw_json = self.tok_trie.decode_str(&generated_ids);
         tracing::debug!(
+            cache_hit,
+            reused_tokens,
+            prefilled_tokens,
             tokens = generated_ids.len(),
             ffn_sparsity_pct = state.ffn_sparsity_ratio() * 100.0,
             raw_json = %raw_json,
@@ -1842,32 +1999,132 @@ impl Rwkv7Llm {
         ))?;
 
         let d = self.cfg.d_model;
-        let formatted = format!("{}\nAssistant:", prompt.trim());
+        let trimmed = prompt.trim();
+        let formatted = format!("{trimmed}\nAssistant:");
         let prompt_ids = self.tok_trie.greedy_tokenize(formatted.as_bytes());
+        let base_ids = self.tok_trie.greedy_tokenize(trimmed.as_bytes());
+        let checkpoint_len = common_prefix_len(&base_ids, &prompt_ids);
 
-        let mut state = Rwkv7State::new(&self.cfg);
-        self.forward_hidden(self.cfg.bos_token_id, &mut state)?;
+        let mut cache = self
+            .prefix_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = cache
+            .working_state
+            .take()
+            .unwrap_or_else(|| Rwkv7State::new(&self.cfg));
 
-        // Prefill coletando os estados ocultos `h_t` para calcular `e_s = mean(h[t0..t1])`
+        let cache_hit = !cache.tokens.is_empty()
+            && cache.layers_snapshot.is_some()
+            && cache.h_prefill.len() == cache.tokens.len().saturating_mul(d)
+            && cache.token_byte_ends.len() == cache.tokens.len()
+            && prompt_ids.starts_with(&cache.tokens);
+
         let mut h_prefill = vec![0.0_f32; prompt_ids.len().saturating_mul(d)];
         let mut token_byte_ends = Vec::with_capacity(prompt_ids.len());
-        let mut byte_cursor = 0_usize;
 
-        for (idx, &tok_id) in prompt_ids.iter().enumerate() {
-            let id = usize::try_from(tok_id)
-                .map_err(|_| LlmError::Inference("prompt token id overflow".to_owned()))?;
-            self.forward_hidden(id, &mut state)?;
+        let (reuse_len, mut byte_cursor) = if cache_hit {
+            let n = cache.tokens.len();
+            if let Some(ref snap) = cache.layers_snapshot {
+                copy_layers(&mut state.layers, snap);
+            }
+            state.total_ffn_cols = 0;
+            state.active_ffn_cols = 0;
+            state.total_ffn_bytes = 0;
+            state.read_ffn_bytes = 0;
+            h_prefill[..n * d].copy_from_slice(&cache.h_prefill);
+            token_byte_ends.extend_from_slice(&cache.token_byte_ends);
+            let cursor = token_byte_ends.last().copied().unwrap_or(0);
+            cache.stats.hits = cache.stats.hits.saturating_add(1);
+            cache.stats.tokens_reused = cache.stats.tokens_reused.saturating_add(n as u64);
+            (n, cursor)
+        } else {
+            state.reset_recurrent_zero();
+            if let Err(err) = self.forward_hidden(self.cfg.bos_token_id, &mut state) {
+                cache.working_state = Some(state);
+                return Err(err);
+            }
+            cache.stats.misses = cache.stats.misses.saturating_add(1);
+            (0, 0)
+        };
+
+        let delta_len = prompt_ids.len().saturating_sub(reuse_len);
+        for (offset, &tok_id) in prompt_ids[reuse_len..].iter().enumerate() {
+            let idx = reuse_len + offset;
+            let Ok(id) = usize::try_from(tok_id) else {
+                cache.working_state = Some(state);
+                return Err(LlmError::Inference("prompt token id overflow".to_owned()));
+            };
+            if let Err(err) = self.forward_hidden(id, &mut state) {
+                cache.working_state = Some(state);
+                return Err(err);
+            }
             h_prefill[idx * d..(idx + 1) * d].copy_from_slice(&state.scratch.x_out);
             byte_cursor = byte_cursor.saturating_add(self.tok_trie.token(tok_id).len());
             token_byte_ends.push(byte_cursor);
+
+            if idx + 1 == checkpoint_len && checkpoint_len > reuse_len {
+                cache.tokens.clear();
+                cache
+                    .tokens
+                    .extend_from_slice(&prompt_ids[..checkpoint_len]);
+                match cache.layers_snapshot {
+                    Some(ref mut snap) => copy_layers(snap, &state.layers),
+                    None => cache.layers_snapshot = Some(state.layers.clone()),
+                }
+                cache.h_prefill.clear();
+                cache
+                    .h_prefill
+                    .extend_from_slice(&h_prefill[..checkpoint_len * d]);
+                cache.token_byte_ends.clear();
+                cache
+                    .token_byte_ends
+                    .extend_from_slice(&token_byte_ends[..checkpoint_len]);
+                cache.checkpoint_x_out.clear();
+                cache.copy_keys.clear();
+                cache.copy_tokens.clear();
+            }
         }
+        cache.stats.tokens_prefilled = cache
+            .stats
+            .tokens_prefilled
+            .saturating_add(delta_len as u64);
+
+        let result = self.decode_isa_after_prefill(
+            isa,
+            &formatted,
+            &h_prefill,
+            &token_byte_ends,
+            strict_citations,
+            &mut state,
+            cache_hit,
+            reuse_len,
+            delta_len,
+        );
+        cache.working_state = Some(state);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_isa_after_prefill(
+        &self,
+        isa: &IsaHeadWeights,
+        formatted: &str,
+        h_prefill: &[f32],
+        token_byte_ends: &[usize],
+        strict_citations: bool,
+        state: &mut Rwkv7State,
+        cache_hit: bool,
+        reused_tokens: usize,
+        prefilled_tokens: usize,
+    ) -> Result<LlmAction, LlmError> {
+        let d = self.cfg.d_model;
 
         // Monta o NeuralEntityBank (Peças B + C)
         let mut bank = NeuralEntityBank::new(isa.ptr_dim);
         let mut pooled_buf = vec![0.0_f32; d];
-        for (entity_text, kind) in extract_prompt_entities(&formatted) {
-            if let Some((t0, t1)) =
-                find_entity_token_span(&formatted, &entity_text, &token_byte_ends)
+        for (entity_text, kind) in extract_prompt_entities(formatted) {
+            if let Some((t0, t1)) = find_entity_token_span(formatted, &entity_text, token_byte_ends)
             {
                 pooled_buf.fill(0.0);
                 let inv_len = 1.0 / ((t1 - t0).max(1) as f32);
@@ -1892,7 +2149,7 @@ impl Rwkv7Llm {
             IsaHeadWeights::argmax_rows(&isa.op_head, ISA_OP_COUNT, d, &state.scratch.x_out);
         let op = Op::ALL[op_idx];
         syms.push(Sym::Op(op));
-        self.forward_hidden_vec(&isa.op_emb[op_idx * d..(op_idx + 1) * d], &mut state)?;
+        self.forward_hidden_vec(&isa.op_emb[op_idx * d..(op_idx + 1) * d], state)?;
 
         // 2. Decodifica argumentos até `expect(&syms)` voltar para `Expect::Op`
         let mut reflist_items = 0_usize;
@@ -1911,11 +2168,11 @@ impl Rwkv7Llm {
                     );
                     let n_u8 = u8::try_from(n_idx).unwrap_or(u8::MAX);
                     syms.push(Sym::Num(n_u8));
-                    self.forward_hidden_vec(&isa.num_emb[n_idx * d..(n_idx + 1) * d], &mut state)?;
+                    self.forward_hidden_vec(&isa.num_emb[n_idx * d..(n_idx + 1) * d], state)?;
                 }
 
                 Expect::Lit => {
-                    let text = self.decode_isa_literal(isa, &mut state, &mut logits_buf)?;
+                    let text = self.decode_isa_literal(isa, state, &mut logits_buf)?;
                     syms.push(Sym::Lit(text));
                 }
 
@@ -1928,7 +2185,7 @@ impl Rwkv7Llm {
                         syms.push(Sym::End);
                         self.forward_hidden_vec(
                             &isa.ctl_emb[CTL_END * d..(CTL_END + 1) * d],
-                            &mut state,
+                            state,
                         )?;
                         break;
                     }
@@ -1957,7 +2214,7 @@ impl Rwkv7Llm {
                         syms.push(Sym::End);
                         self.forward_hidden_vec(
                             &isa.ctl_emb[CTL_END * d..(CTL_END + 1) * d],
-                            &mut state,
+                            state,
                         )?;
                     } else if let Some((slot_id, _)) = best_ptr
                         && ptr_score >= lit_score
@@ -1968,20 +2225,19 @@ impl Rwkv7Llm {
                         }
                         if let Some(entry) = bank.get(slot_id) {
                             isa.build_ptr_feedback(&entry.ptr_key, &mut fb_vec);
-                            self.forward_hidden_vec(&fb_vec, &mut state)?;
+                            self.forward_hidden_vec(&fb_vec, state)?;
                         }
                     } else if allow_lit {
                         self.forward_hidden_vec(
                             &isa.ctl_emb[CTL_LIT_OPEN * d..(CTL_LIT_OPEN + 1) * d],
-                            &mut state,
+                            state,
                         )?;
-                        let text = self.decode_isa_literal(isa, &mut state, &mut logits_buf)?;
+                        let text = self.decode_isa_literal(isa, state, &mut logits_buf)?;
                         syms.push(Sym::Lit(text));
                         if allow_end {
                             reflist_items = reflist_items.saturating_add(1);
                         }
                     } else {
-                        // Caso extremo: banco sem slots elegíveis em Ref estrito
                         return Err(LlmError::Inference(
                             "no eligible entity slot available for strict isa pointer".to_owned(),
                         ));
@@ -1995,6 +2251,9 @@ impl Rwkv7Llm {
             .map_err(|err| LlmError::Inference(format!("isa decode failed: {err}")))?;
 
         tracing::debug!(
+            cache_hit,
+            reused_tokens,
+            prefilled_tokens,
             isa_symbols = syms.len(),
             bank_slots = bank.len(),
             ffn_sparsity_pct = state.ffn_sparsity_ratio() * 100.0,
@@ -2142,6 +2401,30 @@ impl Rwkv7Llm {
             return Err(LlmError::GrammarInit(err));
         }
         Ok(matcher)
+    }
+
+    /// Estatísticas acumuladas de hits/misses e tokens economizados pelo estado vivo entre turnos.
+    #[must_use]
+    pub fn prefix_cache_stats(&self) -> PrefixCacheStats {
+        self.prefix_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stats
+    }
+
+    /// Limpa o snapshot de prefixo mantido em RAM (forçando prefill frio na próxima chamada).
+    pub fn clear_prefix_cache(&self) {
+        let mut cache = self
+            .prefix_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.tokens.clear();
+        cache.layers_snapshot = None;
+        cache.h_prefill.clear();
+        cache.token_byte_ends.clear();
+        cache.checkpoint_x_out.clear();
+        cache.copy_keys.clear();
+        cache.copy_tokens.clear();
     }
 }
 
@@ -2952,6 +3235,43 @@ mod tests {
         let mut wrong_logits = vec![0.0_f32; 4];
         let head_err = model.project_head_into(&mut state, &mut wrong_logits);
         assert!(matches!(head_err, Err(LlmError::InvalidConfig(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn prefix_cache_reuses_multiturn_state_bit_exactly_and_resets_on_new_prompt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let model = build_test_rwkv7_model(4, true, false)?.with_max_new_tokens(8);
+        let turn0 = "USER: Qual o preco_mensal de plano_enterprise?\n";
+        let turn1 = "USER: Qual o preco_mensal de plano_enterprise?\nTOOL: {\"status\":\"found\",\"id\":\"fact-1\"}\n";
+        let other = "USER: Outra conversa completamente diferente.\n";
+
+        // 1. Turno 0: miss + grava snapshot do prefixo
+        let _ = model.generate_action_from_prompt(turn0);
+        let st0 = model.prefix_cache_stats();
+        assert_eq!(st0.misses, 1);
+        assert_eq!(st0.hits, 0);
+        assert!(st0.tokens_prefilled > 0);
+
+        // 2. Turno 1 (extensão do turno 0): hit reutilizando todos os tokens do turno 0
+        let warm_res = model.generate_action_from_prompt(turn1);
+        let st1 = model.prefix_cache_stats();
+        assert_eq!(st1.hits, 1);
+        assert!(
+            st1.tokens_reused >= 20,
+            "expected reused tokens, got {}",
+            st1.tokens_reused
+        );
+
+        // 3. Paridade com prefill frio do turno 1
+        model.clear_prefix_cache();
+        let cold_res = model.generate_action_from_prompt(turn1);
+        assert_eq!(format!("{warm_res:?}"), format!("{cold_res:?}"));
+
+        // 4. Novo prompt independente: invalida automaticamente sem vazar estado
+        let _ = model.generate_action_from_prompt(other);
+        let st2 = model.prefix_cache_stats();
+        assert_eq!(st2.misses, 3);
         Ok(())
     }
 }
