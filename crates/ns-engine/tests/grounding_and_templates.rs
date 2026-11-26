@@ -28,7 +28,7 @@ impl ConstrainedLlm for ScriptedMock {
         self.actions
             .get(idx)
             .cloned()
-            .ok_or_else(|| LlmPortError::Backend("scripted mock exhausted".to_owned()))
+            .ok_or_else(|| LlmPortError::Decoding("scripted mock exhausted".to_owned()))
     }
 }
 
@@ -66,8 +66,8 @@ async fn blocks_degenerate_o_and_nonsense_answers_then_accepts_grounded_repair()
         },
     ]);
 
-    let orch = Orchestrator::new(llm, mem, DefaultSymbolicVerifier::new(), 6)
-        .with_require_citations(true);
+    let orch =
+        Orchestrator::new(llm, mem, DefaultSymbolicVerifier::new(), 6).with_require_citations(true);
 
     let outcome = orch
         .answer("Qual o(a) preco_mensal de plano_enterprise?")
@@ -121,8 +121,8 @@ async fn slot_template_renders_exact_eval_math_and_rejects_wrong_number()
         },
     ]);
 
-    let orch = Orchestrator::new(llm, mem, DefaultSymbolicVerifier::new(), 6)
-        .with_require_citations(true);
+    let orch =
+        Orchestrator::new(llm, mem, DefaultSymbolicVerifier::new(), 6).with_require_citations(true);
 
     let outcome = orch
         .answer("Calcule 4 vezes preco_mensal de plano_enterprise.")
@@ -130,7 +130,7 @@ async fn slot_template_renders_exact_eval_math_and_rejects_wrong_number()
 
     assert_eq!(
         outcome.answer().text(),
-        "Total para 4x preco_mensal (plano_enterprise): 2998.00."
+        "Total para 4x preco_mensal (plano_enterprise): 2998."
     );
     assert_eq!(outcome.audit().repair_count(), 1);
     Ok(())

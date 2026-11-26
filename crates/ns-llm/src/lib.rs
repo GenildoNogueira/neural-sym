@@ -3,18 +3,18 @@ pub mod grammar;
 pub mod isa;
 pub mod isa_adapter;
 pub mod isa_bank;
-pub mod sparse_moe;
 
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
 
 #[cfg(feature = "custom-rwkv")]
-pub mod quant;
-
-#[cfg(feature = "custom-rwkv")]
 pub mod chat;
 #[cfg(feature = "custom-rwkv")]
+pub mod quant;
+#[cfg(feature = "custom-rwkv")]
 pub mod rwkv7;
+#[cfg(feature = "custom-rwkv")]
+pub mod sparse_moe;
 
 pub use error::LlmError;
 pub use grammar::{action_schema_json, action_schema_value};
