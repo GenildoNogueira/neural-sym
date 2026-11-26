@@ -830,6 +830,7 @@ struct Rwkv7Scratch {
     vocab_scores: Vec<f32>,
     copy_vocab_acc: Box<[f32]>,
     moe: Option<SparseMoeScratch>,
+    chunk4: Option<Box<Rwkv7Chunk4Scratch>>,
 }
 
 impl Rwkv7Scratch {
@@ -887,6 +888,66 @@ impl Rwkv7Scratch {
             vocab_scores: Vec::with_capacity(cfg.vocab_size.min(512)),
             copy_vocab_acc: vec![0.0; copy_acc_len].into_boxed_slice(),
             moe,
+            chunk4: None,
+        }
+    }
+}
+
+/// Buffers pré-alocados sob demanda para processar 4 tokens simultâneos (`matmul4_into`)
+/// com zero alocações no heap por bloco de 4 tokens.
+#[derive(Debug, Clone)]
+struct Rwkv7Chunk4Scratch {
+    x_emb: [Box<[f32]>; 4],
+    x: [Box<[f32]>; 4],
+    x_ln: [Box<[f32]>; 4],
+    v_first: [Box<[f32]>; 4],
+    dx: [Box<[f32]>; 4],
+    x_shift: [Box<[f32]>; 4],
+    r: [Box<[f32]>; 4],
+    k: [Box<[f32]>; 4],
+    v: [Box<[f32]>; 4],
+    w_logit: [Box<[f32]>; 4],
+    a_vec: [Box<[f32]>; 4],
+    g_vec: [Box<[f32]>; 4],
+    lora_buf: [Box<[f32]>; 4],
+    rwkv: [Box<[f32]>; 4],
+    tm_out: [Box<[f32]>; 4],
+    cm_k: [Box<[f32]>; 4],
+    q_input: [Box<[i8]>; 4],
+}
+
+impl Rwkv7Chunk4Scratch {
+    fn new(cfg: &Rwkv7Config) -> Self {
+        let d = cfg.d_model;
+        let max_lora = cfg
+            .decay_lora_dim
+            .max(cfg.a_lora_dim)
+            .max(cfg.v_lora_dim)
+            .max(cfg.gate_lora_dim)
+            .max(1);
+        let max_in = d.max(cfg.ffn_dim).max(max_lora);
+
+        let f32_x4 = |len: usize| std::array::from_fn(|_| vec![0.0_f32; len].into_boxed_slice());
+        let i8_x4 = |len: usize| std::array::from_fn(|_| vec![0_i8; len].into_boxed_slice());
+
+        Self {
+            x_emb: f32_x4(d),
+            x: f32_x4(d),
+            x_ln: f32_x4(d),
+            v_first: f32_x4(d),
+            dx: f32_x4(d),
+            x_shift: f32_x4(d),
+            r: f32_x4(d),
+            k: f32_x4(d),
+            v: f32_x4(d),
+            w_logit: f32_x4(d),
+            a_vec: f32_x4(d),
+            g_vec: f32_x4(d),
+            lora_buf: f32_x4(max_lora),
+            rwkv: f32_x4(d),
+            tm_out: f32_x4(d),
+            cm_k: f32_x4(cfg.ffn_dim),
+            q_input: i8_x4(max_in),
         }
     }
 }
@@ -1339,7 +1400,7 @@ impl Rwkv7Llm {
     /// # Errors
     ///
     /// Retorna [`LlmError::Inference`] se `token_id` estiver fora do vocabulário.
-    pub fn forward_hidden(&self, token_id: usize, state: &mut Rwkv7State) -> Result<(), LlmError> {
+    fn forward_hidden(&self, token_id: usize, state: &mut Rwkv7State) -> Result<(), LlmError> {
         self.emb.lookup_into(token_id, &mut state.scratch.x_emb)?;
         self.forward_from_x_emb(state)
     }
@@ -1567,6 +1628,479 @@ impl Rwkv7Llm {
         }
 
         layer_norm_into(&scratch.x, &self.ln_out, eps, &mut scratch.x_out);
+        Ok(())
+    }
+
+    /// Processa 4 tokens consecutivos lendo cada matriz de peso **1 única vez** (`matmul4_into`),
+    /// gravando os 4 vetores `x_out` em `out_x_outs` e deixando `state.scratch.x_out` igual ao 4º token.
+    ///
+    /// # Errors
+    ///
+    /// Retorna [`LlmError`] se algum `token_id` estiver fora do vocabulário.
+    pub fn forward_hidden_chunk4(
+        &self,
+        token_ids: [usize; 4],
+        state: &mut Rwkv7State,
+        out_x_outs: [&mut [f32]; 4],
+    ) -> Result<(), LlmError> {
+        let mut c4_box = state
+            .scratch
+            .chunk4
+            .take()
+            .unwrap_or_else(|| Box::new(Rwkv7Chunk4Scratch::new(&self.cfg)));
+
+        let load_res = (|| -> Result<(), LlmError> {
+            for (tok_id, dst) in token_ids.into_iter().zip(c4_box.x_emb.iter_mut()) {
+                self.emb.lookup_into(tok_id, dst)?;
+            }
+            Ok(())
+        })();
+
+        if let Err(err) = load_res {
+            state.scratch.chunk4 = Some(c4_box);
+            return Err(err);
+        }
+
+        let res = self.forward_from_x_emb_chunk4(&mut c4_box, state, out_x_outs);
+        state.scratch.chunk4 = Some(c4_box);
+        res
+    }
+
+    /// Núcleo em lote de 4 tokens das `n_layers` camadas RWKV-7:
+    /// - Todas as projeções lineares pesadas rodam via `matmul4_into` (1 leitura da RAM / 4 tokens).
+    /// - O loop WKV7 itera `head` por fora e `t = 0..4` por dentro, mantendo cada matriz `64×64`
+    ///   (16 KiB) travada na L1 durante os 4 passos consecutivos.
+    fn forward_from_x_emb_chunk4(
+        &self,
+        c4: &mut Rwkv7Chunk4Scratch,
+        state: &mut Rwkv7State,
+        out_x_outs: [&mut [f32]; 4],
+    ) -> Result<(), LlmError> {
+        let d = self.cfg.d_model;
+        let eps = self.cfg.layer_norm_eps;
+        let gn_eps = self.cfg.group_norm_eps;
+        let hd = self.cfg.head_dim;
+
+        let scratch = &mut state.scratch;
+        for (emb, x_dst) in c4.x_emb.iter().zip(c4.x.iter_mut()) {
+            layer_norm_into(emb, &self.ln_in, eps, x_dst);
+        }
+
+        for (layer_idx, (block, layer_state)) in
+            self.blocks.iter().zip(state.layers.iter_mut()).enumerate()
+        {
+            // 1. Time-Mixing RWKV-7 (LayerNorm + token-shift dos 4 tokens)
+            for (x_src, ln_dst) in c4.x.iter().zip(c4.x_ln.iter_mut()) {
+                layer_norm_into(x_src, &block.ln1, eps, ln_dst);
+            }
+            for (c, dst) in c4.dx[0].iter_mut().enumerate() {
+                *dst = layer_state.prev_x_tm[c] - c4.x_ln[0][c];
+            }
+            for t in 1..4 {
+                let prev_ln = &c4.x_ln[t - 1];
+                let curr_ln = &c4.x_ln[t];
+                for (c, dst) in c4.dx[t].iter_mut().enumerate() {
+                    *dst = prev_ln[c] - curr_ln[c];
+                }
+            }
+            layer_state.prev_x_tm.copy_from_slice(&c4.x_ln[3]);
+
+            let tm = &block.tm;
+
+            // Receptance (r)
+            for t in 0..4 {
+                shift_into(&c4.x_ln[t], &c4.dx[t], &tm.x_r, &mut c4.x_shift[t]);
+            }
+            {
+                let [q0, q1, q2, q3] = &mut c4.q_input;
+                let [r0, r1, r2, r3] = &mut c4.r;
+                tm.receptance.matmul4_into(
+                    [
+                        &c4.x_shift[0][..],
+                        &c4.x_shift[1][..],
+                        &c4.x_shift[2][..],
+                        &c4.x_shift[3][..],
+                    ],
+                    [&mut q0[..], &mut q1[..], &mut q2[..], &mut q3[..]],
+                    [&mut r0[..], &mut r1[..], &mut r2[..], &mut r3[..]],
+                );
+            }
+
+            // Key (k)
+            for t in 0..4 {
+                shift_into(&c4.x_ln[t], &c4.dx[t], &tm.x_k, &mut c4.x_shift[t]);
+            }
+            {
+                let [q0, q1, q2, q3] = &mut c4.q_input;
+                let [k0, k1, k2, k3] = &mut c4.k;
+                tm.key.matmul4_into(
+                    [
+                        &c4.x_shift[0][..],
+                        &c4.x_shift[1][..],
+                        &c4.x_shift[2][..],
+                        &c4.x_shift[3][..],
+                    ],
+                    [&mut q0[..], &mut q1[..], &mut q2[..], &mut q3[..]],
+                    [&mut k0[..], &mut k1[..], &mut k2[..], &mut k3[..]],
+                );
+            }
+
+            // Value (v) + residual v_first
+            for t in 0..4 {
+                shift_into(&c4.x_ln[t], &c4.dx[t], &tm.x_v, &mut c4.x_shift[t]);
+            }
+            {
+                let [q0, q1, q2, q3] = &mut c4.q_input;
+                let [v0, v1, v2, v3] = &mut c4.v;
+                tm.value.matmul4_into(
+                    [
+                        &c4.x_shift[0][..],
+                        &c4.x_shift[1][..],
+                        &c4.x_shift[2][..],
+                        &c4.x_shift[3][..],
+                    ],
+                    [&mut q0[..], &mut q1[..], &mut q2[..], &mut q3[..]],
+                    [&mut v0[..], &mut v1[..], &mut v2[..], &mut v3[..]],
+                );
+            }
+
+            if layer_idx == 0 {
+                for (vf, v_src) in c4.v_first.iter_mut().zip(c4.v.iter()) {
+                    vf.copy_from_slice(v_src);
+                }
+            } else if let Some(ref vr) = tm.v_res {
+                let ldim = vr.lora_dim;
+                {
+                    let [q0, q1, q2, q3] = &mut c4.q_input;
+                    let [l0, l1, l2, l3] = &mut c4.lora_buf;
+                    vr.v1.matmul4_into(
+                        [
+                            &c4.x_shift[0][..],
+                            &c4.x_shift[1][..],
+                            &c4.x_shift[2][..],
+                            &c4.x_shift[3][..],
+                        ],
+                        [&mut q0[..], &mut q1[..], &mut q2[..], &mut q3[..]],
+                        [
+                            &mut l0[..ldim],
+                            &mut l1[..ldim],
+                            &mut l2[..ldim],
+                            &mut l3[..ldim],
+                        ],
+                    );
+                }
+                {
+                    let [q0, q1, q2, q3] = &mut c4.q_input;
+                    let [o0, o1, o2, o3] = &mut c4.tm_out;
+                    vr.v2.matmul4_into(
+                        [
+                            &c4.lora_buf[0][..ldim],
+                            &c4.lora_buf[1][..ldim],
+                            &c4.lora_buf[2][..ldim],
+                            &c4.lora_buf[3][..ldim],
+                        ],
+                        [&mut q0[..], &mut q1[..], &mut q2[..], &mut q3[..]],
+                        [&mut o0[..], &mut o1[..], &mut o2[..], &mut o3[..]],
+                    );
+                }
+                for t in 0..4 {
+                    for c in 0..d {
+                        let gate = sigmoid(vr.v0[c] + c4.tm_out[t][c]);
+                        c4.v[t][c] += (c4.v_first[t][c] - c4.v[t][c]) * gate;
+                    }
+                }
+            }
+
+            // Decay (w_logit)
+            for t in 0..4 {
+                shift_into(&c4.x_ln[t], &c4.dx[t], &tm.x_w, &mut c4.x_shift[t]);
+            }
+            let w_ldim = self.cfg.decay_lora_dim;
+            {
+                let [q0, q1, q2, q3] = &mut c4.q_input;
+                let [l0, l1, l2, l3] = &mut c4.lora_buf;
+                tm.w1.matmul4_into(
+                    [
+                        &c4.x_shift[0][..],
+                        &c4.x_shift[1][..],
+                        &c4.x_shift[2][..],
+                        &c4.x_shift[3][..],
+                    ],
+                    [&mut q0[..], &mut q1[..], &mut q2[..], &mut q3[..]],
+                    [
+                        &mut l0[..w_ldim],
+                        &mut l1[..w_ldim],
+                        &mut l2[..w_ldim],
+                        &mut l3[..w_ldim],
+                    ],
+                );
+            }
+            for buf in &mut c4.lora_buf {
+                for val in &mut buf[..w_ldim] {
+                    *val = val.tanh();
+                }
+            }
+            {
+                let [q0, q1, q2, q3] = &mut c4.q_input;
+                let [w0, w1, w2, w3] = &mut c4.w_logit;
+                tm.w2.matmul4_into(
+                    [
+                        &c4.lora_buf[0][..w_ldim],
+                        &c4.lora_buf[1][..w_ldim],
+                        &c4.lora_buf[2][..w_ldim],
+                        &c4.lora_buf[3][..w_ldim],
+                    ],
+                    [&mut q0[..], &mut q1[..], &mut q2[..], &mut q3[..]],
+                    [&mut w0[..], &mut w1[..], &mut w2[..], &mut w3[..]],
+                );
+            }
+            for w_vec in &mut c4.w_logit {
+                for (dst, &bias) in w_vec.iter_mut().zip(tm.w0.iter()) {
+                    *dst += bias;
+                }
+            }
+
+            // In-context learning rate (a_vec)
+            for t in 0..4 {
+                shift_into(&c4.x_ln[t], &c4.dx[t], &tm.x_a, &mut c4.x_shift[t]);
+            }
+            let a_ldim = self.cfg.a_lora_dim;
+            {
+                let [q0, q1, q2, q3] = &mut c4.q_input;
+                let [l0, l1, l2, l3] = &mut c4.lora_buf;
+                tm.a1.matmul4_into(
+                    [
+                        &c4.x_shift[0][..],
+                        &c4.x_shift[1][..],
+                        &c4.x_shift[2][..],
+                        &c4.x_shift[3][..],
+                    ],
+                    [&mut q0[..], &mut q1[..], &mut q2[..], &mut q3[..]],
+                    [
+                        &mut l0[..a_ldim],
+                        &mut l1[..a_ldim],
+                        &mut l2[..a_ldim],
+                        &mut l3[..a_ldim],
+                    ],
+                );
+            }
+            {
+                let [q0, q1, q2, q3] = &mut c4.q_input;
+                let [a0, a1, a2, a3] = &mut c4.a_vec;
+                tm.a2.matmul4_into(
+                    [
+                        &c4.lora_buf[0][..a_ldim],
+                        &c4.lora_buf[1][..a_ldim],
+                        &c4.lora_buf[2][..a_ldim],
+                        &c4.lora_buf[3][..a_ldim],
+                    ],
+                    [&mut q0[..], &mut q1[..], &mut q2[..], &mut q3[..]],
+                    [&mut a0[..], &mut a1[..], &mut a2[..], &mut a3[..]],
+                );
+            }
+            for a_out in &mut c4.a_vec {
+                for (dst, &bias) in a_out.iter_mut().zip(tm.a0.iter()) {
+                    *dst = sigmoid(bias + *dst);
+                }
+            }
+
+            // Gate (g_vec)
+            for t in 0..4 {
+                shift_into(&c4.x_ln[t], &c4.dx[t], &tm.x_g, &mut c4.x_shift[t]);
+            }
+            let g_ldim = self.cfg.gate_lora_dim;
+            {
+                let [q0, q1, q2, q3] = &mut c4.q_input;
+                let [l0, l1, l2, l3] = &mut c4.lora_buf;
+                tm.g1.matmul4_into(
+                    [
+                        &c4.x_shift[0][..],
+                        &c4.x_shift[1][..],
+                        &c4.x_shift[2][..],
+                        &c4.x_shift[3][..],
+                    ],
+                    [&mut q0[..], &mut q1[..], &mut q2[..], &mut q3[..]],
+                    [
+                        &mut l0[..g_ldim],
+                        &mut l1[..g_ldim],
+                        &mut l2[..g_ldim],
+                        &mut l3[..g_ldim],
+                    ],
+                );
+            }
+            for buf in &mut c4.lora_buf {
+                for val in &mut buf[..g_ldim] {
+                    *val = sigmoid(*val);
+                }
+            }
+            {
+                let [q0, q1, q2, q3] = &mut c4.q_input;
+                let [g0, g1, g2, g3] = &mut c4.g_vec;
+                tm.g2.matmul4_into(
+                    [
+                        &c4.lora_buf[0][..g_ldim],
+                        &c4.lora_buf[1][..g_ldim],
+                        &c4.lora_buf[2][..g_ldim],
+                        &c4.lora_buf[3][..g_ldim],
+                    ],
+                    [&mut q0[..], &mut q1[..], &mut q2[..], &mut q3[..]],
+                    [&mut g0[..], &mut g1[..], &mut g2[..], &mut g3[..]],
+                );
+            }
+
+            // Regra Delta WKV7: `head` por fora mantém cada bloco 64×64 (16 KiB) quente na L1 por 4 passos
+            for head in 0..self.n_heads {
+                let off = head * hd;
+                let mat_off = head * hd * hd;
+                let s_mat = &mut layer_state.state_mat[mat_off..mat_off + hd * hd];
+
+                for t in 0..4 {
+                    prepare_head_vectors(
+                        &c4.k[t][off..off + hd],
+                        &tm.k_k[off..off + hd],
+                        &tm.k_a[off..off + hd],
+                        &c4.a_vec[t][off..off + hd],
+                        &c4.w_logit[t][off..off + hd],
+                        &mut scratch.kk_head,
+                        &mut scratch.k_hat_head,
+                        &mut scratch.w_decay_head,
+                    );
+
+                    wkv7_head_step(
+                        s_mat,
+                        &c4.r[t][off..off + hd],
+                        &scratch.w_decay_head,
+                        &scratch.k_hat_head,
+                        &c4.v[t][off..off + hd],
+                        &scratch.kk_head,
+                        &c4.a_vec[t][off..off + hd],
+                        &mut scratch.ak_head,
+                        &mut scratch.y_head,
+                    );
+
+                    group_norm_and_bonus(
+                        &scratch.y_head,
+                        &c4.r[t][off..off + hd],
+                        &scratch.k_hat_head,
+                        &c4.v[t][off..off + hd],
+                        &tm.r_k[off..off + hd],
+                        &tm.ln_x.weight[off..off + hd],
+                        &tm.ln_x.bias[off..off + hd],
+                        gn_eps,
+                        &mut c4.rwkv[t][off..off + hd],
+                    );
+                }
+            }
+
+            for (rwkv_vec, g_vec) in c4.rwkv.iter_mut().zip(c4.g_vec.iter()) {
+                for (dst, &g) in rwkv_vec.iter_mut().zip(g_vec.iter()) {
+                    *dst *= g;
+                }
+            }
+            {
+                let [q0, q1, q2, q3] = &mut c4.q_input;
+                let [o0, o1, o2, o3] = &mut c4.tm_out;
+                tm.output.matmul4_into(
+                    [
+                        &c4.rwkv[0][..],
+                        &c4.rwkv[1][..],
+                        &c4.rwkv[2][..],
+                        &c4.rwkv[3][..],
+                    ],
+                    [&mut q0[..], &mut q1[..], &mut q2[..], &mut q3[..]],
+                    [&mut o0[..], &mut o1[..], &mut o2[..], &mut o3[..]],
+                );
+            }
+            for (x_vec, out_vec) in c4.x.iter_mut().zip(c4.tm_out.iter()) {
+                for (dst, &delta) in x_vec.iter_mut().zip(out_vec.iter()) {
+                    *dst += delta;
+                }
+            }
+
+            // 2. Channel-Mixing RWKV-7 (FFN em lote de 4 no `key` + acumulação esparsa no `value`)
+            for (x_src, ln_dst) in c4.x.iter().zip(c4.x_ln.iter_mut()) {
+                layer_norm_into(x_src, &block.ln2, eps, ln_dst);
+            }
+            for (c, dst) in c4.x_shift[0].iter_mut().enumerate() {
+                *dst = c4.x_ln[0][c] + block.cm.x_k[c] * (layer_state.prev_x_cm[c] - c4.x_ln[0][c]);
+            }
+            for t in 1..4 {
+                let prev_ln = &c4.x_ln[t - 1];
+                let curr_ln = &c4.x_ln[t];
+                for (c, dst) in c4.x_shift[t].iter_mut().enumerate() {
+                    *dst = curr_ln[c] + block.cm.x_k[c] * (prev_ln[c] - curr_ln[c]);
+                }
+            }
+            layer_state.prev_x_cm.copy_from_slice(&c4.x_ln[3]);
+
+            match &block.cm.ffn {
+                ChannelMixingFfn::Dense { key, value } => {
+                    {
+                        let [q0, q1, q2, q3] = &mut c4.q_input;
+                        let [c0, c1, c2, c3] = &mut c4.cm_k;
+                        key.matmul4_into(
+                            [
+                                &c4.x_shift[0][..],
+                                &c4.x_shift[1][..],
+                                &c4.x_shift[2][..],
+                                &c4.x_shift[3][..],
+                            ],
+                            [&mut q0[..], &mut q1[..], &mut q2[..], &mut q3[..]],
+                            [&mut c0[..], &mut c1[..], &mut c2[..], &mut c3[..]],
+                        );
+                    }
+                    let mut active_sum = 0_usize;
+                    for (cm_vec, x_vec) in c4.cm_k.iter_mut().zip(c4.x.iter_mut()) {
+                        for val in cm_vec.iter_mut() {
+                            let r = val.max(0.0);
+                            *val = r * r;
+                        }
+                        active_sum =
+                            active_sum.saturating_add(value.accumulate_sparse(cm_vec, x_vec));
+                    }
+                    let total_bytes = (key.weight_bytes() + value.weight_bytes()).saturating_mul(4);
+                    // `key` foi lida 1x da RAM para os 4 tokens; `value` leu apenas as colunas ativas.
+                    let read_bytes = key
+                        .weight_bytes()
+                        .saturating_add(active_sum.saturating_mul(value.col_stride_bytes()));
+                    state.total_ffn_cols = state
+                        .total_ffn_cols
+                        .saturating_add((self.cfg.ffn_dim as u64).saturating_mul(4));
+                    state.active_ffn_cols = state.active_ffn_cols.saturating_add(active_sum as u64);
+                    state.total_ffn_bytes =
+                        state.total_ffn_bytes.saturating_add(total_bytes as u64);
+                    state.read_ffn_bytes = state.read_ffn_bytes.saturating_add(read_bytes as u64);
+                }
+                ChannelMixingFfn::SparseMoe(moe) => {
+                    if let Some(ref mut moe_sc) = scratch.moe {
+                        for t in 0..4 {
+                            let stats = moe.forward_into(
+                                &c4.x_shift[t],
+                                &mut c4.q_input[t],
+                                moe_sc,
+                                &mut c4.x[t],
+                            );
+                            state.total_ffn_cols =
+                                state.total_ffn_cols.saturating_add(stats.cols_total as u64);
+                            state.active_ffn_cols = state
+                                .active_ffn_cols
+                                .saturating_add(stats.cols_active as u64);
+                            state.total_ffn_bytes = state
+                                .total_ffn_bytes
+                                .saturating_add(stats.total_weight_bytes as u64);
+                            state.read_ffn_bytes =
+                                state.read_ffn_bytes.saturating_add(stats.bytes_read as u64);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (x_src, out_dst) in c4.x.iter().zip(out_x_outs.into_iter()) {
+            layer_norm_into(x_src, &self.ln_out, eps, out_dst);
+        }
+        // Mantém `state.scratch.x_out` sincronizado com o 4º token (paridade com `forward_hidden`)
+        layer_norm_into(&c4.x[3], &self.ln_out, eps, &mut scratch.x_out);
         Ok(())
     }
 
@@ -1835,10 +2369,7 @@ impl Rwkv7Llm {
                 if n >= record_from
                     && let Some(&next_tok) = prompt_ids.get(n)
                 {
-                    state
-                        .scratch
-                        .x_out
-                        .copy_from_slice(&cache.checkpoint_x_out);
+                    state.scratch.x_out.copy_from_slice(&cache.checkpoint_x_out);
                     self.record_copy_entry(&mut state, next_tok);
                 }
             }
@@ -2064,43 +2595,61 @@ impl Rwkv7Llm {
         };
 
         let delta_len = prompt_ids.len().saturating_sub(reuse_len);
-        for (offset, &tok_id) in prompt_ids[reuse_len..].iter().enumerate() {
-            let idx = reuse_len + offset;
-            let Ok(id) = usize::try_from(tok_id) else {
-                cache.working_state = Some(state);
-                return Err(LlmError::Inference("prompt token id overflow".to_owned()));
-            };
-            if let Err(err) = self.forward_hidden(id, &mut state) {
+
+        // Segmento 1: até o checkpoint compartilhável entre turnos (em blocos de 4)
+        if checkpoint_len > reuse_len {
+            if let Err(err) = self.prefill_isa_range(
+                &prompt_ids,
+                reuse_len,
+                checkpoint_len,
+                &mut state,
+                &mut h_prefill,
+                &mut token_byte_ends,
+                &mut byte_cursor,
+            ) {
                 cache.working_state = Some(state);
                 return Err(err);
             }
-            h_prefill[idx * d..(idx + 1) * d].copy_from_slice(&state.scratch.x_out);
-            byte_cursor = byte_cursor.saturating_add(self.tok_trie.token(tok_id).len());
-            token_byte_ends.push(byte_cursor);
 
-            if idx + 1 == checkpoint_len && checkpoint_len > reuse_len {
-                cache.tokens.clear();
-                cache
-                    .tokens
-                    .extend_from_slice(&prompt_ids[..checkpoint_len]);
-                match cache.layers_snapshot {
-                    Some(ref mut snap) => copy_layers(snap, &state.layers),
-                    None => cache.layers_snapshot = Some(state.layers.clone()),
-                }
-                cache.h_prefill.clear();
-                cache
-                    .h_prefill
-                    .extend_from_slice(&h_prefill[..checkpoint_len * d]);
-                cache.token_byte_ends.clear();
-                cache
-                    .token_byte_ends
-                    .extend_from_slice(&token_byte_ends[..checkpoint_len]);
-                cache.checkpoint_x_out.clear();
-                cache.copy_start_idx = 0;
-                cache.copy_keys.clear();
-                cache.copy_tokens.clear();
+            cache.tokens.clear();
+            cache
+                .tokens
+                .extend_from_slice(&prompt_ids[..checkpoint_len]);
+            match cache.layers_snapshot {
+                Some(ref mut snap) => copy_layers(snap, &state.layers),
+                None => cache.layers_snapshot = Some(state.layers.clone()),
             }
+            cache.h_prefill.clear();
+            cache
+                .h_prefill
+                .extend_from_slice(&h_prefill[..checkpoint_len * d]);
+            cache.token_byte_ends.clear();
+            cache
+                .token_byte_ends
+                .extend_from_slice(&token_byte_ends[..checkpoint_len]);
+            cache.checkpoint_x_out.clear();
+            cache.copy_start_idx = 0;
+            cache.copy_keys.clear();
+            cache.copy_tokens.clear();
         }
+
+        // Segmento 2: sufixo "\nAssistant:" (também em bloco de 4 quando >= 4 tokens)
+        let tail_start = checkpoint_len.max(reuse_len);
+        if tail_start < prompt_ids.len()
+            && let Err(err) = self.prefill_isa_range(
+                &prompt_ids,
+                tail_start,
+                prompt_ids.len(),
+                &mut state,
+                &mut h_prefill,
+                &mut token_byte_ends,
+                &mut byte_cursor,
+            )
+        {
+            cache.working_state = Some(state);
+            return Err(err);
+        }
+
         cache.stats.tokens_prefilled = cache
             .stats
             .tokens_prefilled
@@ -2119,6 +2668,97 @@ impl Rwkv7Llm {
         );
         cache.working_state = Some(state);
         result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_isa_range(
+        &self,
+        prompt_ids: &[TokenId],
+        start: usize,
+        end: usize,
+        state: &mut Rwkv7State,
+        h_prefill: &mut [f32],
+        token_byte_ends: &mut Vec<usize>,
+        byte_cursor: &mut usize,
+    ) -> Result<(), LlmError> {
+        let d = self.cfg.d_model;
+        let mut idx = start;
+
+        while idx + 4 <= end {
+            let t0 = usize::try_from(prompt_ids[idx])
+                .map_err(|_| LlmError::Inference("prompt token id overflow".to_owned()))?;
+            let t1 = usize::try_from(prompt_ids[idx + 1])
+                .map_err(|_| LlmError::Inference("prompt token id overflow".to_owned()))?;
+            let t2 = usize::try_from(prompt_ids[idx + 2])
+                .map_err(|_| LlmError::Inference("prompt token id overflow".to_owned()))?;
+            let t3 = usize::try_from(prompt_ids[idx + 3])
+                .map_err(|_| LlmError::Inference("prompt token id overflow".to_owned()))?;
+
+            let (s0, rest) = h_prefill[idx * d..(idx + 4) * d].split_at_mut(d);
+            let (s1, rest) = rest.split_at_mut(d);
+            let (s2, s3) = rest.split_at_mut(d);
+
+            self.forward_hidden_chunk4([t0, t1, t2, t3], state, [s0, s1, s2, s3])?;
+
+            for &tok_id in &prompt_ids[idx..idx + 4] {
+                *byte_cursor = byte_cursor.saturating_add(self.tok_trie.token(tok_id).len());
+                token_byte_ends.push(*byte_cursor);
+            }
+            idx += 4;
+        }
+
+        while idx < end {
+            let tok_id = prompt_ids[idx];
+            let id = usize::try_from(tok_id)
+                .map_err(|_| LlmError::Inference("prompt token id overflow".to_owned()))?;
+            self.forward_hidden(id, state)?;
+            h_prefill[idx * d..(idx + 1) * d].copy_from_slice(&state.scratch.x_out);
+            *byte_cursor = byte_cursor.saturating_add(self.tok_trie.token(tok_id).len());
+            token_byte_ends.push(*byte_cursor);
+            idx += 1;
+        }
+
+        Ok(())
+    }
+
+    fn prefill_plain_range(
+        &self,
+        prompt_ids: &[TokenId],
+        start: usize,
+        end: usize,
+        state: &mut Rwkv7State,
+    ) -> Result<(), LlmError> {
+        let d = self.cfg.d_model;
+        let mut idx = start;
+
+        if end.saturating_sub(start) >= 4 {
+            let mut tmp = vec![0.0_f32; 4 * d];
+            while idx + 4 <= end {
+                let t0 = usize::try_from(prompt_ids[idx])
+                    .map_err(|_| LlmError::Inference("token id conversion overflow".to_owned()))?;
+                let t1 = usize::try_from(prompt_ids[idx + 1])
+                    .map_err(|_| LlmError::Inference("token id conversion overflow".to_owned()))?;
+                let t2 = usize::try_from(prompt_ids[idx + 2])
+                    .map_err(|_| LlmError::Inference("token id conversion overflow".to_owned()))?;
+                let t3 = usize::try_from(prompt_ids[idx + 3])
+                    .map_err(|_| LlmError::Inference("token id conversion overflow".to_owned()))?;
+
+                let (s0, rest) = tmp.split_at_mut(d);
+                let (s1, rest) = rest.split_at_mut(d);
+                let (s2, s3) = rest.split_at_mut(d);
+                self.forward_hidden_chunk4([t0, t1, t2, t3], state, [s0, s1, s2, s3])?;
+                idx += 4;
+            }
+        }
+
+        while idx < end {
+            let id = usize::try_from(prompt_ids[idx])
+                .map_err(|_| LlmError::Inference("token id conversion overflow".to_owned()))?;
+            self.forward_hidden(id, state)?;
+            idx += 1;
+        }
+
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3299,6 +3939,82 @@ mod tests {
         let _ = model.generate_action_from_prompt(other);
         let st2 = model.prefix_cache_stats();
         assert_eq!(st2.misses, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn forward_hidden_chunk4_matches_sequential_forward_hidden_and_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let model = build_test_rwkv7_model(4, false, false)?;
+        let d = model.cfg.d_model;
+        let tokens = [3_usize, 11, 27, 5, 42, 19, 8, 31];
+
+        // 1. Referência sequencial (1 token por vez)
+        let mut state_seq = Rwkv7State::new(&model.cfg);
+        model.forward_hidden(model.cfg.bos_token_id, &mut state_seq)?;
+        let mut seq_outs = Vec::with_capacity(tokens.len());
+        for &tok in &tokens {
+            model.forward_hidden(tok, &mut state_seq)?;
+            seq_outs.push(state_seq.scratch.x_out.to_vec());
+        }
+
+        // 2. Prefill em blocos de 4 (`forward_hidden_chunk4`)
+        let mut state_c4 = Rwkv7State::new(&model.cfg);
+        model.forward_hidden(model.cfg.bos_token_id, &mut state_c4)?;
+        let mut c4_flat = vec![0.0_f32; tokens.len() * d];
+        for chunk_idx in 0..2 {
+            let base = chunk_idx * 4;
+            let ids = [
+                tokens[base],
+                tokens[base + 1],
+                tokens[base + 2],
+                tokens[base + 3],
+            ];
+            let (s0, rest) = c4_flat[base * d..(base + 4) * d].split_at_mut(d);
+            let (s1, rest) = rest.split_at_mut(d);
+            let (s2, s3) = rest.split_at_mut(d);
+            model.forward_hidden_chunk4(ids, &mut state_c4, [s0, s1, s2, s3])?;
+        }
+
+        // Todos os 8 `x_out` devem bater
+        for (idx, expected) in seq_outs.iter().enumerate() {
+            let got = &c4_flat[idx * d..(idx + 1) * d];
+            for (c, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (g - e).abs() < 1e-4,
+                    "token {idx} dim {c}: chunk4={g} vs seq={e}"
+                );
+            }
+        }
+
+        // `scratch.x_out` final deve bater com o último token
+        for (c, (&g, &e)) in state_c4
+            .scratch
+            .x_out
+            .iter()
+            .zip(state_seq.scratch.x_out.iter())
+            .enumerate()
+        {
+            assert!((g - e).abs() < 1e-4, "final x_out dim {c}: {g} vs {e}");
+        }
+
+        // Todos os estados recorrentes das camadas devem bater
+        for (l, (lc4, lseq)) in state_c4
+            .layers
+            .iter()
+            .zip(state_seq.layers.iter())
+            .enumerate()
+        {
+            for (i, (&g, &e)) in lc4.state_mat.iter().zip(lseq.state_mat.iter()).enumerate() {
+                assert!((g - e).abs() < 1e-4, "layer {l} state_mat[{i}]: {g} vs {e}");
+            }
+            for (i, (&g, &e)) in lc4.prev_x_tm.iter().zip(lseq.prev_x_tm.iter()).enumerate() {
+                assert!((g - e).abs() < 1e-4, "layer {l} prev_x_tm[{i}]: {g} vs {e}");
+            }
+            for (i, (&g, &e)) in lc4.prev_x_cm.iter().zip(lseq.prev_x_cm.iter()).enumerate() {
+                assert!((g - e).abs() < 1e-4, "layer {l} prev_x_cm[{i}]: {g} vs {e}");
+            }
+        }
         Ok(())
     }
 }
