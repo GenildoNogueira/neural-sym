@@ -1,11 +1,9 @@
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Instant;
 
-use llguidance::api::TopLevelGrammar;
-use llguidance::toktrie::{ApproximateTokEnv, SimpleVob, TokEnv, TokRxInfo, TokTrie, TokenId};
-use llguidance::{Matcher, ParserFactory};
+use llguidance::toktrie::{TokRxInfo, TokTrie, TokenId};
 use ns_core::action::LlmAction;
 use ns_core::error::LlmPortError;
 use ns_core::fact::{Message, Role};
@@ -15,7 +13,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::chat::{ChatRng, ChatSamplingConfig, ChatTurnStats, Utf8StreamBuffer, sample_logits};
 use crate::error::LlmError;
-use crate::grammar::action_schema_value;
 use crate::isa::{Expect, Op, Sym, decode_one, expect};
 use crate::isa_bank::{
     NeuralEntityBank, SlotFilter, extract_prompt_entities, find_entity_token_span,
@@ -741,44 +738,6 @@ impl Rwkv7BlockWeights {
 }
 
 #[derive(Debug, Clone)]
-struct CopyGateWeights {
-    copy_dim: usize,
-    inv_sqrt_dim: f32,
-    query: QuantizedMatrix,
-    key: QuantizedMatrix,
-    gate_weight: Box<[f32]>,
-    gate_bias: f32,
-}
-
-impl CopyGateWeights {
-    fn load(st: &SafeTensors<'_>, d_model: usize, copy_dim: usize) -> Result<Self, LlmError> {
-        let query = QuantizedMatrix::load_from_safetensors(st, "copy_q.weight", copy_dim, d_model)?;
-        let key = QuantizedMatrix::load_from_safetensors(st, "copy_k.weight", copy_dim, d_model)?;
-        let gate_in = d_model
-            .checked_add(copy_dim)
-            .ok_or_else(|| LlmError::ModelLoad("copy_gate input dimension overflow".to_owned()))?;
-        let gate_weight = read_f32_boxed(st, "copy_gate.weight", &[1, gate_in])?;
-        let gate_bias_slice = read_f32_boxed(st, "copy_gate.bias", &[1])?;
-        let gate_bias = gate_bias_slice.first().copied().unwrap_or(0.0);
-
-        Ok(Self {
-            copy_dim,
-            inv_sqrt_dim: 1.0 / (copy_dim as f32).sqrt(),
-            query,
-            key,
-            gate_weight,
-            gate_bias,
-        })
-    }
-
-    const fn weight_bytes(&self) -> usize {
-        self.query.weight_bytes()
-            + self.key.weight_bytes()
-            + (self.gate_weight.len() + 1) * std::mem::size_of::<f32>()
-    }
-}
-
-#[derive(Debug, Clone)]
 struct Rwkv7LayerState {
     prev_x_tm: Box<[f32]>,
     prev_x_cm: Box<[f32]>,
@@ -820,15 +779,6 @@ struct Rwkv7Scratch {
     tm_out: Box<[f32]>,
     cm_k: Box<[f32]>,
     q_input: Box<[i8]>,
-    allowed_tokens: Vec<usize>,
-    // Buffers do Pointer/Copy Gate
-    copy_q: Box<[f32]>,
-    copy_ctx: Box<[f32]>,
-    copy_keys: Vec<f32>,
-    copy_tokens: Vec<TokenId>,
-    copy_attn: Vec<f32>,
-    vocab_scores: Vec<f32>,
-    copy_vocab_acc: Box<[f32]>,
     moe: Option<SparseMoeScratch>,
     chunk4: Option<Box<Rwkv7Chunk4Scratch>>,
 }
@@ -844,10 +794,6 @@ impl Rwkv7Scratch {
             .max(1);
         let max_in = d.max(cfg.ffn_dim).max(max_lora);
         let hd = cfg.head_dim;
-
-        let copy_dim = cfg.copy_dim;
-        let copy_cap = if copy_dim > 0 { cfg.copy_max_len } else { 0 };
-        let copy_acc_len = if copy_dim > 0 { cfg.vocab_size } else { 0 };
 
         let moe = if cfg.moe_num_experts > 0 {
             Some(SparseMoeScratch::new(cfg.moe_num_experts, cfg.ffn_dim))
@@ -879,14 +825,6 @@ impl Rwkv7Scratch {
             tm_out: vec![0.0; d].into_boxed_slice(),
             cm_k: vec![0.0; cfg.ffn_dim].into_boxed_slice(),
             q_input: vec![0_i8; max_in].into_boxed_slice(),
-            allowed_tokens: Vec::with_capacity(cfg.vocab_size.min(512)),
-            copy_q: vec![0.0; copy_dim].into_boxed_slice(),
-            copy_ctx: vec![0.0; copy_dim].into_boxed_slice(),
-            copy_keys: Vec::with_capacity(copy_cap.saturating_mul(copy_dim)),
-            copy_tokens: Vec::with_capacity(copy_cap),
-            copy_attn: Vec::with_capacity(copy_cap),
-            vocab_scores: Vec::with_capacity(cfg.vocab_size.min(512)),
-            copy_vocab_acc: vec![0.0; copy_acc_len].into_boxed_slice(),
             moe,
             chunk4: None,
         }
@@ -967,10 +905,6 @@ struct PrefixStateCache {
     layers_snapshot: Option<Box<[Rwkv7LayerState]>>,
     h_prefill: Vec<f32>,
     token_byte_ends: Vec<usize>,
-    checkpoint_x_out: Vec<f32>,
-    copy_start_idx: usize,
-    copy_keys: Vec<f32>,
-    copy_tokens: Vec<TokenId>,
     working_state: Option<Rwkv7State>,
     stats: PrefixCacheStats,
 }
@@ -1037,12 +971,6 @@ impl Rwkv7State {
         1.0 - (self.active_ffn_cols as f64) / (self.total_ffn_cols as f64)
     }
 
-    /// Quantidade de entradas registradas atualmente no banco de cópia do prompt.
-    #[must_use]
-    pub fn copy_bank_len(&self) -> usize {
-        self.scratch.copy_tokens.len()
-    }
-
     /// Fração física de bytes da FFN que não precisaram ser lidos da RAM (0.0 .. 1.0).
     #[must_use]
     pub fn ffn_ram_skip_ratio(&self) -> f64 {
@@ -1059,8 +987,6 @@ impl Rwkv7State {
             layer.prev_x_cm.fill(0.0);
             layer.state_mat.fill(0.0);
         }
-        self.scratch.copy_keys.clear();
-        self.scratch.copy_tokens.clear();
         self.total_ffn_cols = 0;
         self.active_ffn_cols = 0;
         self.total_ffn_bytes = 0;
@@ -1069,20 +995,16 @@ impl Rwkv7State {
 }
 
 /// Motor nativo RWKV-v7 ("Goose") em Rust puro com W8A8, pulo de zeros `ReLU²`,
-/// Pointer/Copy Gate e constrained decoding via `llguidance` + `TokTrie` (RWKV World 65k).
+/// e constrained decoding via `llguidance` + `TokTrie` (RWKV World 65k).
 pub struct Rwkv7Llm {
     cfg: Rwkv7Config,
     n_heads: usize,
     tok_trie: TokTrie,
-    parser_factory: ParserFactory,
-    grammar: TopLevelGrammar,
     emb: EmbeddingTable,
     ln_in: LayerNormWeights,
     blocks: Box<[Rwkv7BlockWeights]>,
     ln_out: LayerNormWeights,
     head: QuantizedMatrix,
-    copy_gate: Option<CopyGateWeights>,
-    decode_mode: DecodeMode,
     isa_head: Option<IsaHeadWeights>,
     max_new_tokens: usize,
     prefix_cache: Mutex<PrefixStateCache>,
@@ -1092,7 +1014,7 @@ impl std::fmt::Debug for Rwkv7Llm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Rwkv7Llm")
             .field("cfg", &self.cfg)
-            .field("copy_gate_enabled", &self.copy_gate.is_some())
+            .field("isa_head_enabled", &self.isa_head.is_some())
             .field("total_weight_bytes", &self.total_weight_bytes())
             .finish_non_exhaustive()
     }
@@ -1145,17 +1067,6 @@ impl Rwkv7Llm {
 
         let rx_info = TokRxInfo::new(vocab_u32, eos_u32);
         let tok_trie = TokTrie::from(&rx_info, &words);
-        let tok_env: TokEnv = Arc::new(ApproximateTokEnv::new(tok_trie.clone()));
-
-        let parser_factory = ParserFactory::new_simple(&tok_env)
-            .map_err(|err| LlmError::GrammarInit(err.to_string()))?;
-        let schema_value = action_schema_value()?;
-        let grammar = TopLevelGrammar::from_json_schema(schema_value);
-
-        let probe = Matcher::new(parser_factory.create_parser(grammar.clone()));
-        if let Some(err) = probe.get_error() {
-            return Err(LlmError::GrammarInit(err));
-        }
 
         let st = SafeTensors::deserialize(safetensors_bytes)
             .map_err(|err| LlmError::ModelLoad(format!("invalid safetensors buffer: {err}")))?;
@@ -1306,11 +1217,6 @@ impl Rwkv7Llm {
 
         let ln_out = read_ln(&st, "ln_out", d)?;
         let head = QuantizedMatrix::load_from_safetensors(&st, "head.weight", v, d)?;
-        let copy_gate = if cfg.copy_dim > 0 {
-            Some(CopyGateWeights::load(&st, d, cfg.copy_dim)?)
-        } else {
-            None
-        };
         let isa_head = if cfg.isa_ptr_dim > 0 {
             Some(IsaHeadWeights::load(
                 &st,
@@ -1326,15 +1232,11 @@ impl Rwkv7Llm {
             cfg,
             n_heads,
             tok_trie,
-            parser_factory,
-            grammar,
             emb,
             ln_in,
             blocks: blocks.into_boxed_slice(),
             ln_out,
             head,
-            copy_gate,
-            decode_mode: DecodeMode::Auto,
             isa_head,
             max_new_tokens: 256,
             prefix_cache: Mutex::new(PrefixStateCache::default()),
@@ -1344,7 +1246,8 @@ impl Rwkv7Llm {
             vocab = model.cfg.vocab_size,
             d_model = model.cfg.d_model,
             n_layers = model.cfg.n_layers,
-            copy_dim = model.cfg.copy_dim,
+            isa_head = model.isa_head.is_some(),
+            q4_backend = crate::quant::active_q4_backend(),
             total_mib = (model.total_weight_bytes() as f64) / (1024.0 * 1024.0),
             "native rwkv-7 goose model loaded"
         );
@@ -1363,13 +1266,6 @@ impl Rwkv7Llm {
         &self.cfg
     }
 
-    /// Define explicitamente o modo de decodificação (`Auto`, `Json` ou `Isa`).
-    #[must_use]
-    pub const fn with_decode_mode(mut self, mode: DecodeMode) -> Self {
-        self.decode_mode = mode;
-        self
-    }
-
     #[must_use]
     pub fn total_weight_bytes(&self) -> usize {
         let blocks_bytes: usize = self
@@ -1377,10 +1273,6 @@ impl Rwkv7Llm {
             .iter()
             .map(Rwkv7BlockWeights::weight_bytes)
             .sum();
-        let copy_bytes = self
-            .copy_gate
-            .as_ref()
-            .map_or(0, CopyGateWeights::weight_bytes);
         let isa_bytes = self
             .isa_head
             .as_ref()
@@ -1390,7 +1282,6 @@ impl Rwkv7Llm {
             .bytes()
             .saturating_add(blocks_bytes)
             .saturating_add(self.head.weight_bytes())
-            .saturating_add(copy_bytes)
             .saturating_add(isa_bytes)
     }
 
@@ -1400,7 +1291,7 @@ impl Rwkv7Llm {
     /// # Errors
     ///
     /// Retorna [`LlmError::Inference`] se `token_id` estiver fora do vocabulário.
-    fn forward_hidden(&self, token_id: usize, state: &mut Rwkv7State) -> Result<(), LlmError> {
+    pub fn forward_hidden(&self, token_id: usize, state: &mut Rwkv7State) -> Result<(), LlmError> {
         self.emb.lookup_into(token_id, &mut state.scratch.x_emb)?;
         self.forward_from_x_emb(state)
     }
@@ -2124,402 +2015,6 @@ impl Rwkv7Llm {
         Ok(logits)
     }
 
-    /// Registra o estado atual no Copy Bank apontando para `next_prompt_tok`.
-    pub fn record_copy_entry(&self, state: &mut Rwkv7State, next_prompt_tok: TokenId) {
-        let Some(ref cg) = self.copy_gate else {
-            return;
-        };
-        if state.scratch.copy_tokens.len() >= self.cfg.copy_max_len {
-            return;
-        }
-        let scratch = &mut state.scratch;
-        let base = scratch.copy_keys.len();
-        scratch
-            .copy_keys
-            .resize(base.saturating_add(cg.copy_dim), 0.0);
-        cg.key.matvec_into(
-            &scratch.x_out,
-            &mut scratch.q_input,
-            &mut scratch.copy_keys[base..base + cg.copy_dim],
-        );
-        scratch.copy_tokens.push(next_prompt_tok);
-    }
-
-    /// Amostra o próximo token respeitando `SimpleVob` do `llguidance` (+ Copy Gate quando ativo).
-    #[must_use]
-    pub fn sample_with_copy_gate(
-        &self,
-        state: &mut Rwkv7State,
-        mask: &SimpleVob,
-    ) -> Option<(TokenId, f32)> {
-        let Some(ref cg) = self.copy_gate else {
-            return self
-                .head
-                .argmax_masked(
-                    &state.scratch.x_out,
-                    mask,
-                    &mut state.scratch.q_input,
-                    &mut state.scratch.allowed_tokens,
-                )
-                .map(|tok| (tok, 0.0));
-        };
-
-        let num_entries = state.scratch.copy_tokens.len();
-        if num_entries == 0 {
-            return self
-                .head
-                .argmax_masked(
-                    &state.scratch.x_out,
-                    mask,
-                    &mut state.scratch.q_input,
-                    &mut state.scratch.allowed_tokens,
-                )
-                .map(|tok| (tok, 0.0));
-        }
-
-        let scratch = &mut state.scratch;
-        scratch.allowed_tokens.clear();
-        for row in 0..self.cfg.vocab_size {
-            let Ok(tok_id) = TokenId::try_from(row) else {
-                break;
-            };
-            if mask.is_allowed(tok_id) {
-                scratch.allowed_tokens.push(row);
-            }
-        }
-        if scratch.allowed_tokens.is_empty() {
-            return None;
-        }
-
-        let d_c = cg.copy_dim;
-        cg.query
-            .matvec_into(&scratch.x_out, &mut scratch.q_input, &mut scratch.copy_q);
-
-        scratch.copy_attn.clear();
-        scratch.copy_attn.reserve(num_entries);
-        let mut max_score = f32::NEG_INFINITY;
-
-        for slot in 0..num_entries {
-            let k_slice = &scratch.copy_keys[slot * d_c..(slot + 1) * d_c];
-            let mut dot = 0.0_f32;
-            for (qv, kv) in scratch.copy_q.iter().zip(k_slice.iter()) {
-                dot += qv * kv;
-            }
-            let scaled = dot * cg.inv_sqrt_dim;
-            if scaled > max_score {
-                max_score = scaled;
-            }
-            scratch.copy_attn.push(scaled);
-        }
-
-        let mut attn_sum = 0.0_f32;
-        for val in &mut scratch.copy_attn {
-            let e = (*val - max_score).exp();
-            *val = e;
-            attn_sum += e;
-        }
-        let inv_attn_sum = if attn_sum > 0.0 { 1.0 / attn_sum } else { 0.0 };
-
-        scratch.copy_ctx.fill(0.0);
-        let mut any_allowed_copy = false;
-        for slot in 0..num_entries {
-            let weight = scratch.copy_attn[slot] * inv_attn_sum;
-            let k_slice = &scratch.copy_keys[slot * d_c..(slot + 1) * d_c];
-            for (dst, &kv) in scratch.copy_ctx.iter_mut().zip(k_slice.iter()) {
-                *dst += weight * kv;
-            }
-            let tok = scratch.copy_tokens[slot];
-            if mask.is_allowed(tok)
-                && let Ok(idx) = usize::try_from(tok)
-                && let Some(acc) = scratch.copy_vocab_acc.get_mut(idx)
-            {
-                *acc += weight;
-                any_allowed_copy = true;
-            }
-        }
-
-        let d_model = self.cfg.d_model;
-        let mut gate_logit = cg.gate_bias;
-        for (w, v) in cg.gate_weight[..d_model].iter().zip(scratch.x_out.iter()) {
-            gate_logit += w * v;
-        }
-        for (w, v) in cg.gate_weight[d_model..]
-            .iter()
-            .zip(scratch.copy_ctx.iter())
-        {
-            gate_logit += w * v;
-        }
-        let p_copy = sigmoid(gate_logit).clamp(1e-6, 1.0 - 1e-6);
-
-        self.head.scores_for_rows(
-            &scratch.x_out,
-            &scratch.allowed_tokens,
-            &mut scratch.q_input,
-            &mut scratch.vocab_scores,
-        );
-
-        let max_logit = scratch
-            .vocab_scores
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
-        let mut vocab_sum = 0.0_f32;
-        for s in &mut scratch.vocab_scores {
-            let e = (*s - max_logit).exp();
-            *s = e;
-            vocab_sum += e;
-        }
-        let inv_vocab_sum = if vocab_sum > 0.0 {
-            1.0 / vocab_sum
-        } else {
-            0.0
-        };
-
-        let eff_copy = if any_allowed_copy { p_copy } else { 0.0 };
-        let eff_gen = 1.0 - eff_copy;
-
-        let mut best_row: Option<usize> = None;
-        let mut best_prob = f32::NEG_INFINITY;
-        for (&row, &exp_logit) in scratch
-            .allowed_tokens
-            .iter()
-            .zip(scratch.vocab_scores.iter())
-        {
-            let p_vocab = exp_logit * inv_vocab_sum;
-            let p_c = scratch.copy_vocab_acc.get(row).copied().unwrap_or(0.0);
-            let combined = eff_gen * p_vocab + eff_copy * p_c;
-            if best_row.is_none()
-                || combined > best_prob
-                || (combined == best_prob && best_row.is_some_and(|prev| row < prev))
-            {
-                best_prob = combined;
-                best_row = Some(row);
-            }
-        }
-
-        for &tok in &scratch.copy_tokens {
-            if let Ok(idx) = usize::try_from(tok)
-                && let Some(acc) = scratch.copy_vocab_acc.get_mut(idx)
-            {
-                *acc = 0.0;
-            }
-        }
-
-        best_row
-            .and_then(|row| TokenId::try_from(row).ok())
-            .map(|tok| (tok, eff_copy))
-    }
-
-    /// Gera uma [`LlmAction`] 100% aderente ao JSON Schema usando o RWKV-7 G1 + `llguidance`,
-    /// reutilizando o estado recorrente O(1) do prefixo entre turnos do `Orchestrator`.
-    ///
-    /// # Errors
-    ///
-    /// Retorna [`LlmError`] se a inferência, a gramática ou a desserialização JSON falharem.
-    pub fn generate_action_from_prompt(&self, prompt: &str) -> Result<LlmAction, LlmError> {
-        let trimmed = prompt.trim();
-        let formatted = format!("{trimmed}\nAssistant:");
-        let prompt_ids = self.tok_trie.greedy_tokenize(formatted.as_bytes());
-        let base_ids = self.tok_trie.greedy_tokenize(trimmed.as_bytes());
-        let checkpoint_len = common_prefix_len(&base_ids, &prompt_ids);
-        let record_from = prompt_ids.len().saturating_sub(self.cfg.copy_max_len);
-
-        let mut cache = self
-            .prefix_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut state = cache
-            .working_state
-            .take()
-            .unwrap_or_else(|| Rwkv7State::new(&self.cfg));
-
-        let copy_ok = self.copy_gate.is_none()
-            || (record_from >= cache.copy_start_idx
-                && cache.copy_tokens.len()
-                    == cache.tokens.len().saturating_sub(cache.copy_start_idx)
-                && cache.checkpoint_x_out.len() == self.cfg.d_model);
-        let cache_hit = !cache.tokens.is_empty()
-            && cache.layers_snapshot.is_some()
-            && copy_ok
-            && prompt_ids.starts_with(&cache.tokens);
-
-        let reuse_len = if cache_hit {
-            let n = cache.tokens.len();
-            if let Some(ref snap) = cache.layers_snapshot {
-                copy_layers(&mut state.layers, snap);
-            }
-            state.total_ffn_cols = 0;
-            state.active_ffn_cols = 0;
-            state.total_ffn_bytes = 0;
-            state.read_ffn_bytes = 0;
-            state.scratch.copy_keys.clear();
-            state.scratch.copy_tokens.clear();
-            if let Some(ref cg) = self.copy_gate {
-                if record_from < n {
-                    let skip = record_from.saturating_sub(cache.copy_start_idx);
-                    state
-                        .scratch
-                        .copy_keys
-                        .extend_from_slice(&cache.copy_keys[skip * cg.copy_dim..]);
-                    state
-                        .scratch
-                        .copy_tokens
-                        .extend_from_slice(&cache.copy_tokens[skip..]);
-                }
-                if n >= record_from
-                    && let Some(&next_tok) = prompt_ids.get(n)
-                {
-                    state.scratch.x_out.copy_from_slice(&cache.checkpoint_x_out);
-                    self.record_copy_entry(&mut state, next_tok);
-                }
-            }
-            cache.stats.hits = cache.stats.hits.saturating_add(1);
-            cache.stats.tokens_reused = cache.stats.tokens_reused.saturating_add(n as u64);
-            n
-        } else {
-            state.reset_recurrent_zero();
-            if let Err(err) = self.forward_hidden(self.cfg.bos_token_id, &mut state) {
-                cache.working_state = Some(state);
-                return Err(err);
-            }
-            if record_from == 0
-                && let Some(&first_tok) = prompt_ids.first()
-            {
-                self.record_copy_entry(&mut state, first_tok);
-            }
-            cache.stats.misses = cache.stats.misses.saturating_add(1);
-            0
-        };
-
-        let delta_len = prompt_ids.len().saturating_sub(reuse_len);
-        for (offset, &tok_id) in prompt_ids[reuse_len..].iter().enumerate() {
-            let idx = reuse_len + offset;
-            let Ok(id) = usize::try_from(tok_id) else {
-                cache.working_state = Some(state);
-                return Err(LlmError::Inference(
-                    "token id conversion overflow".to_owned(),
-                ));
-            };
-            if let Err(err) = self.forward_hidden(id, &mut state) {
-                cache.working_state = Some(state);
-                return Err(err);
-            }
-
-            if idx + 1 == checkpoint_len && checkpoint_len > reuse_len {
-                cache.tokens.clear();
-                cache
-                    .tokens
-                    .extend_from_slice(&prompt_ids[..checkpoint_len]);
-                match cache.layers_snapshot {
-                    Some(ref mut snap) => copy_layers(snap, &state.layers),
-                    None => cache.layers_snapshot = Some(state.layers.clone()),
-                }
-                cache.h_prefill.clear();
-                cache.token_byte_ends.clear();
-                cache.checkpoint_x_out.clear();
-                cache.copy_start_idx = 0;
-                cache.copy_keys.clear();
-                cache.copy_tokens.clear();
-                if self.copy_gate.is_some() {
-                    cache.copy_start_idx = record_from.min(checkpoint_len);
-                    cache
-                        .checkpoint_x_out
-                        .extend_from_slice(&state.scratch.x_out);
-                    cache.copy_keys.extend_from_slice(&state.scratch.copy_keys);
-                    cache
-                        .copy_tokens
-                        .extend_from_slice(&state.scratch.copy_tokens);
-                }
-            }
-
-            let next_idx = idx.saturating_add(1);
-            if next_idx >= record_from
-                && let Some(&next_tok) = prompt_ids.get(next_idx)
-            {
-                self.record_copy_entry(&mut state, next_tok);
-            }
-        }
-        cache.stats.tokens_prefilled = cache
-            .stats
-            .tokens_prefilled
-            .saturating_add(delta_len as u64);
-
-        let result = self.decode_json_after_prefill(&mut state, cache_hit, reuse_len, delta_len);
-        cache.working_state = Some(state);
-        result
-    }
-
-    fn decode_json_after_prefill(
-        &self,
-        state: &mut Rwkv7State,
-        cache_hit: bool,
-        reused_tokens: usize,
-        prefilled_tokens: usize,
-    ) -> Result<LlmAction, LlmError> {
-        let mut matcher = Matcher::new(self.parser_factory.create_parser(self.grammar.clone()));
-        if let Some(err) = matcher.get_error() {
-            return Err(LlmError::GrammarInit(err));
-        }
-
-        let eos_u32 = TokenId::try_from(self.cfg.eos_token_id)
-            .map_err(|_| LlmError::Inference("eos_token_id exceeds u32".to_owned()))?;
-        let mut generated_ids: Vec<TokenId> = Vec::with_capacity(64);
-
-        while generated_ids.len() < self.max_new_tokens && !matcher.is_stopped() {
-            let mask = matcher
-                .compute_mask()
-                .map_err(|err| LlmError::GrammarInit(err.to_string()))?;
-
-            let (next_tok, p_copy) = self.sample_with_copy_gate(state, &mask).ok_or_else(|| {
-                LlmError::GrammarInit("llguidance mask allowed zero tokens".to_owned())
-            })?;
-
-            tracing::trace!(next_tok, p_copy, "rwkv7 sampled token");
-
-            matcher
-                .consume_token(next_tok)
-                .map_err(|err| LlmError::GrammarInit(err.to_string()))?;
-
-            if next_tok == eos_u32 {
-                break;
-            }
-
-            generated_ids.push(next_tok);
-            let next_usize = usize::try_from(next_tok).map_err(|_| {
-                LlmError::Inference("generated token conversion overflow".to_owned())
-            })?;
-            self.forward_hidden(next_usize, state)?;
-
-            for ff_tok in matcher.consume_ff_tokens() {
-                if ff_tok == eos_u32 || generated_ids.len() >= self.max_new_tokens {
-                    break;
-                }
-                generated_ids.push(ff_tok);
-                let ff_usize = usize::try_from(ff_tok).map_err(|_| {
-                    LlmError::Inference("fast-forward token conversion overflow".to_owned())
-                })?;
-                self.forward_hidden(ff_usize, state)?;
-            }
-        }
-
-        let raw_json = self.tok_trie.decode_str(&generated_ids);
-        tracing::debug!(
-            cache_hit,
-            reused_tokens,
-            prefilled_tokens,
-            tokens = generated_ids.len(),
-            ffn_sparsity_pct = state.ffn_sparsity_ratio() * 100.0,
-            raw_json = %raw_json,
-            "rwkv-7 goose emitted constrained action json"
-        );
-
-        serde_json::from_str::<LlmAction>(raw_json.trim()).map_err(|err| {
-            LlmError::Inference(format!(
-                "constrained rwkv7 json failed LlmAction deserialization: {err}; raw={raw_json}"
-            ))
-        })
-    }
-
     /// Indica se o checkpoint carregado possui a Dual-Head ISA + Entity Pointer ativa.
     #[must_use]
     pub const fn has_isa_head(&self) -> bool {
@@ -2627,10 +2122,6 @@ impl Rwkv7Llm {
             cache
                 .token_byte_ends
                 .extend_from_slice(&token_byte_ends[..checkpoint_len]);
-            cache.checkpoint_x_out.clear();
-            cache.copy_start_idx = 0;
-            cache.copy_keys.clear();
-            cache.copy_tokens.clear();
         }
 
         // Segmento 2: sufixo "\nAssistant:" (também em bloco de 4 quando >= 4 tokens)
@@ -2715,46 +2206,6 @@ impl Rwkv7Llm {
             h_prefill[idx * d..(idx + 1) * d].copy_from_slice(&state.scratch.x_out);
             *byte_cursor = byte_cursor.saturating_add(self.tok_trie.token(tok_id).len());
             token_byte_ends.push(*byte_cursor);
-            idx += 1;
-        }
-
-        Ok(())
-    }
-
-    fn prefill_plain_range(
-        &self,
-        prompt_ids: &[TokenId],
-        start: usize,
-        end: usize,
-        state: &mut Rwkv7State,
-    ) -> Result<(), LlmError> {
-        let d = self.cfg.d_model;
-        let mut idx = start;
-
-        if end.saturating_sub(start) >= 4 {
-            let mut tmp = vec![0.0_f32; 4 * d];
-            while idx + 4 <= end {
-                let t0 = usize::try_from(prompt_ids[idx])
-                    .map_err(|_| LlmError::Inference("token id conversion overflow".to_owned()))?;
-                let t1 = usize::try_from(prompt_ids[idx + 1])
-                    .map_err(|_| LlmError::Inference("token id conversion overflow".to_owned()))?;
-                let t2 = usize::try_from(prompt_ids[idx + 2])
-                    .map_err(|_| LlmError::Inference("token id conversion overflow".to_owned()))?;
-                let t3 = usize::try_from(prompt_ids[idx + 3])
-                    .map_err(|_| LlmError::Inference("token id conversion overflow".to_owned()))?;
-
-                let (s0, rest) = tmp.split_at_mut(d);
-                let (s1, rest) = rest.split_at_mut(d);
-                let (s2, s3) = rest.split_at_mut(d);
-                self.forward_hidden_chunk4([t0, t1, t2, t3], state, [s0, s1, s2, s3])?;
-                idx += 4;
-            }
-        }
-
-        while idx < end {
-            let id = usize::try_from(prompt_ids[idx])
-                .map_err(|_| LlmError::Inference("token id conversion overflow".to_owned()))?;
-            self.forward_hidden(id, state)?;
             idx += 1;
         }
 
@@ -3030,21 +2481,6 @@ impl Rwkv7Llm {
         Ok(())
     }
 
-    /// Projeta a `head` apenas nas linhas autorizadas pelo bitset `SimpleVob` do `llguidance`.
-    #[must_use]
-    pub fn sample_masked_from_hidden(
-        &self,
-        state: &mut Rwkv7State,
-        mask: &SimpleVob,
-    ) -> Option<TokenId> {
-        self.head.argmax_masked(
-            &state.scratch.x_out,
-            mask,
-            &mut state.scratch.q_input,
-            &mut state.scratch.allowed_tokens,
-        )
-    }
-
     /// Projeta a `head` apenas no subconjunto explícito de linhas `rows` (para benchmarks de esparsidade).
     #[must_use]
     pub fn sample_subset_from_hidden(
@@ -3054,19 +2490,6 @@ impl Rwkv7Llm {
     ) -> Option<TokenId> {
         self.head
             .argmax_rows(&state.scratch.x_out, rows, &mut state.scratch.q_input)
-    }
-
-    /// Cria um [`Matcher`] novo do `llguidance` vinculado ao JSON Schema de [`LlmAction`].
-    ///
-    /// # Errors
-    ///
-    /// Retorna [`LlmError::GrammarInit`] se o parser reportar erro de compilação.
-    pub fn new_grammar_matcher(&self) -> Result<Matcher, LlmError> {
-        let matcher = Matcher::new(self.parser_factory.create_parser(self.grammar.clone()));
-        if let Some(err) = matcher.get_error() {
-            return Err(LlmError::GrammarInit(err));
-        }
-        Ok(matcher)
     }
 
     /// Estatísticas acumuladas de hits/misses e tokens economizados pelo estado vivo entre turnos.
@@ -3088,39 +2511,33 @@ impl Rwkv7Llm {
         cache.layers_snapshot = None;
         cache.h_prefill.clear();
         cache.token_byte_ends.clear();
-        cache.checkpoint_x_out.clear();
-        cache.copy_start_idx = 0;
-        cache.copy_keys.clear();
-        cache.copy_tokens.clear();
     }
+}
+
+fn format_history_prompt(history: &[Message]) -> String {
+    let mut out = String::new();
+    for msg in history {
+        let prefix = match msg.role {
+            Role::System => "SYSTEM",
+            Role::User => "USER",
+            Role::Assistant => "ASSISTANT",
+            Role::Tool => "TOOL",
+        };
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(prefix);
+        out.push_str(": ");
+        out.push_str(msg.content.trim());
+    }
+    out
 }
 
 impl ConstrainedLlm for Rwkv7Llm {
     async fn next_action(&self, history: &[Message]) -> Result<LlmAction, LlmPortError> {
-        let mut prompt = String::with_capacity(256);
-        for msg in history {
-            let prefix = match msg.role {
-                Role::System => "SYSTEM: ",
-                Role::User => "USER: ",
-                Role::Assistant => "ASSISTANT: ",
-                Role::Tool => "TOOL: ",
-            };
-            prompt.push_str(prefix);
-            prompt.push_str(&msg.content);
-            prompt.push('\n');
-        }
-        let action = match self.decode_mode {
-            DecodeMode::Auto => {
-                if self.has_isa_head() {
-                    self.generate_action_isa(&prompt, true)?
-                } else {
-                    self.generate_action_from_prompt(&prompt)?
-                }
-            }
-            DecodeMode::Json => self.generate_action_from_prompt(&prompt)?,
-            DecodeMode::Isa => self.generate_action_isa(&prompt, true)?,
-        };
-        Ok(action)
+        let prompt = format_history_prompt(history);
+        self.generate_action_isa(&prompt, true)
+            .map_err(|err| LlmPortError::Decoding(err.to_string()))
     }
 }
 
@@ -3421,9 +2838,8 @@ mod tests {
     }
 
     fn build_test_rwkv7_model(
-        copy_dim: usize,
+        isa_ptr_dim: usize,
         quantize_emb: bool,
-        zero_head: bool,
     ) -> Result<Rwkv7Llm, Box<dyn std::error::Error>> {
         fn push_f32(
             bufs: &mut Vec<(String, Vec<usize>, Dtype, Vec<u8>)>,
@@ -3456,10 +2872,10 @@ mod tests {
             layer_norm_eps: 1e-5,
             group_norm_eps: 64e-5,
             vocab_file: "vocab.bin".to_owned(),
-            copy_dim,
-            isa_ptr_dim: 0,
+            copy_dim: 0,
+            isa_ptr_dim,
             isa_num_vocab: 64,
-            copy_max_len: 64,
+            copy_max_len: 0,
             moe_num_experts: 0,
             moe_top_k: 2,
             moe_neuron_top_k: 0,
@@ -3631,34 +3047,56 @@ mod tests {
             &mut bufs,
             "head.weight",
             vec![cfg.vocab_size, cfg.d_model],
-            if zero_head { 0.0 } else { 0.1 },
+            0.1,
         );
 
-        if copy_dim > 0 {
+        // Dual-Head ISA sintética (verifique se os nomes abaixo batem 1:1 com `IsaHeadWeights::load`)
+        if isa_ptr_dim > 0 {
             push_f32(
                 &mut bufs,
-                "copy_gate.weight",
-                vec![1, cfg.d_model + copy_dim],
-                0.0,
+                "isa.op_head.weight",
+                vec![ISA_OP_COUNT, cfg.d_model],
+                0.05,
             );
-            push_f32(&mut bufs, "copy_gate.bias", vec![1], 10.0);
-
-            let mut proj = vec![0.0_f32; copy_dim * cfg.d_model];
-            for r in 0..copy_dim.min(cfg.d_model) {
-                proj[r * cfg.d_model + r] = 1.0;
-            }
-            bufs.push((
-                "copy_q.weight".to_owned(),
-                vec![copy_dim, cfg.d_model],
-                Dtype::F32,
-                to_le_bytes(&proj),
-            ));
-            bufs.push((
-                "copy_k.weight".to_owned(),
-                vec![copy_dim, cfg.d_model],
-                Dtype::F32,
-                to_le_bytes(&proj),
-            ));
+            push_f32(
+                &mut bufs,
+                "isa.op_emb.weight",
+                vec![ISA_OP_COUNT, cfg.d_model],
+                0.05,
+            );
+            push_f32(
+                &mut bufs,
+                "isa.num_head.weight",
+                vec![cfg.isa_num_vocab, cfg.d_model],
+                0.05,
+            );
+            push_f32(
+                &mut bufs,
+                "isa.num_emb.weight",
+                vec![cfg.isa_num_vocab, cfg.d_model],
+                0.05,
+            );
+            push_f32(&mut bufs, "isa.ctl_head.weight", vec![3, cfg.d_model], 0.5);
+            push_f32(&mut bufs, "isa.ctl_emb.weight", vec![3, cfg.d_model], 0.05);
+            push_f32(
+                &mut bufs,
+                "isa.ptr_k.weight",
+                vec![isa_ptr_dim, cfg.d_model],
+                0.05,
+            );
+            push_f32(
+                &mut bufs,
+                "isa.ptr_q.weight",
+                vec![isa_ptr_dim, cfg.d_model],
+                0.05,
+            );
+            push_f32(
+                &mut bufs,
+                "isa.ptr_in.weight",
+                vec![cfg.d_model, isa_ptr_dim],
+                0.05,
+            );
+            push_f32(&mut bufs, "isa.ptr_tag", vec![cfg.d_model], 0.05);
         }
 
         let mut views = HashMap::with_capacity(bufs.len());
@@ -3795,7 +3233,7 @@ mod tests {
     fn rwkv7_runs_constant_o1_state_with_both_f32_and_i8_embeddings()
     -> Result<(), Box<dyn std::error::Error>> {
         for quantize_emb in [false, true] {
-            let model = build_test_rwkv7_model(0, quantize_emb, false)?;
+            let model = build_test_rwkv7_model(0, quantize_emb)?;
             let mut state = Rwkv7State::new(model.config());
             let initial_bytes = state.state_bytes();
 
@@ -3815,46 +3253,9 @@ mod tests {
     }
 
     #[test]
-    fn rwkv7_copy_gate_copies_exact_prompt_token_with_zero_vocab_head()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let model = build_test_rwkv7_model(4, true, true)?;
-        let mut state = Rwkv7State::new(model.config());
-
-        state
-            .scratch
-            .x_out
-            .copy_from_slice(&[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
-        model.record_copy_entry(&mut state, 12);
-
-        state
-            .scratch
-            .x_out
-            .copy_from_slice(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
-        model.record_copy_entry(&mut state, 42);
-        assert_eq!(state.copy_bank_len(), 2);
-
-        state
-            .scratch
-            .x_out
-            .copy_from_slice(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
-
-        let mut mask = SimpleVob::alloc(model.config().vocab_size);
-        mask.allow_token(12);
-        mask.allow_token(42);
-
-        let (winner, p_copy) = model
-            .sample_with_copy_gate(&mut state, &mask)
-            .ok_or("expected sampled token")?;
-        assert_eq!(winner, 42);
-        assert!(p_copy > 0.999, "expected open copy gate, got {p_copy}");
-        assert!(state.scratch.copy_vocab_acc.iter().all(|&v| v == 0.0));
-        Ok(())
-    }
-
-    #[test]
     fn rwkv7_chat_session_keeps_constant_state_across_turns_and_resets()
     -> Result<(), Box<dyn std::error::Error>> {
-        let model = build_test_rwkv7_model(0, true, false)?;
+        let model = build_test_rwkv7_model(0, true)?;
         let mut session = model.start_chat(Some("Voce e um assistente tecnico."))?;
         let state_bytes_initial = session.state_bytes();
         let tokens_after_sys = session.total_tokens_seen();
@@ -3890,7 +3291,7 @@ mod tests {
     #[test]
     fn rwkv7_rejects_invalid_vocab_and_out_of_range_token() -> Result<(), Box<dyn std::error::Error>>
     {
-        let model = build_test_rwkv7_model(0, false, false)?;
+        let model = build_test_rwkv7_model(0, false)?;
         let mut state = Rwkv7State::new(model.config());
 
         let err = model.forward_hidden(999_999, &mut state);
@@ -3908,20 +3309,20 @@ mod tests {
     #[test]
     fn prefix_cache_reuses_multiturn_state_bit_exactly_and_resets_on_new_prompt()
     -> Result<(), Box<dyn std::error::Error>> {
-        let model = build_test_rwkv7_model(4, true, false)?.with_max_new_tokens(8);
+        let model = build_test_rwkv7_model(4, true)?.with_max_new_tokens(8);
         let turn0 = "USER: Qual o preco_mensal de plano_enterprise?\n";
         let turn1 = "USER: Qual o preco_mensal de plano_enterprise?\nTOOL: {\"status\":\"found\",\"id\":\"fact-1\"}\n";
         let other = "USER: Outra conversa completamente diferente.\n";
 
         // 1. Turno 0: miss + grava snapshot do prefixo
-        let _ = model.generate_action_from_prompt(turn0);
+        let _ = model.generate_action_isa(turn0, false)?;
         let st0 = model.prefix_cache_stats();
         assert_eq!(st0.misses, 1);
         assert_eq!(st0.hits, 0);
         assert!(st0.tokens_prefilled > 0);
 
         // 2. Turno 1 (extensão do turno 0): hit reutilizando todos os tokens do turno 0
-        let warm_res = model.generate_action_from_prompt(turn1);
+        let warm_res = model.generate_action_isa(turn1, false)?;
         let st1 = model.prefix_cache_stats();
         assert_eq!(st1.hits, 1);
         assert!(
@@ -3930,13 +3331,13 @@ mod tests {
             st1.tokens_reused
         );
 
-        // 3. Paridade com prefill frio do turno 1
+        // 3. Paridade exata com prefill frio do turno 1
         model.clear_prefix_cache();
-        let cold_res = model.generate_action_from_prompt(turn1);
-        assert_eq!(format!("{warm_res:?}"), format!("{cold_res:?}"));
+        let cold_res = model.generate_action_isa(turn1, false)?;
+        assert_eq!(warm_res, cold_res);
 
         // 4. Novo prompt independente: invalida automaticamente sem vazar estado
-        let _ = model.generate_action_from_prompt(other);
+        let _ = model.generate_action_isa(other, false)?;
         let st2 = model.prefix_cache_stats();
         assert_eq!(st2.misses, 3);
         Ok(())
@@ -3945,7 +3346,7 @@ mod tests {
     #[test]
     fn forward_hidden_chunk4_matches_sequential_forward_hidden_and_state()
     -> Result<(), Box<dyn std::error::Error>> {
-        let model = build_test_rwkv7_model(4, false, false)?;
+        let model = build_test_rwkv7_model(4, false)?;
         let d = model.cfg.d_model;
         let tokens = [3_usize, 11, 27, 5, 42, 19, 8, 31];
 

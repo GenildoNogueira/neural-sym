@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use clap::{Args as ClapArgs, Parser, Subcommand};
 use ns_core::prelude::*;
 use ns_engine::{Orchestrator, VerifiedOutcome};
 use ns_llm::{MockLlm, action_schema_json};
@@ -130,31 +130,19 @@ pub enum DatasetCommand {
     },
 }
 
-/// Modo de decodificacao do backend RWKV-7 no subcomando `ask`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum CliDecodeMode {
-    Auto,
-    Json,
-    Isa,
-}
-
 #[derive(ClapArgs, Debug, Clone)]
 pub struct AskArgs {
     /// Pergunta enviada ao orquestrador
     #[arg(short, long)]
     pub prompt: String,
 
-    /// Diretorio do modelo RWKV-7 (config.json + vocab.bin + model.safetensors)
+    /// Diretorio do modelo RWKV-7 ISA (config.json + vocab.bin + model.safetensors)
     #[arg(
         long,
         conflicts_with_all = ["actions_file", "actions_json"],
         required_unless_present_any = ["actions_file", "actions_json"]
     )]
     pub rwkv_dir: Option<PathBuf>,
-
-    /// Modo de decodificacao do RWKV-7: auto, json (llguidance) ou isa (Dual-Head + ponteiros)
-    #[arg(long, value_enum, default_value_t = CliDecodeMode::Auto)]
-    pub mode: CliDecodeMode,
 
     /// Quantidade de fatos candidatos pre-injetados antes do passo 0 (0 = desativado; Peca D)
     #[arg(long, default_value_t = 0)]
@@ -227,7 +215,7 @@ pub struct ChatArgs {
     #[arg(long, default_value_t = true)]
     pub stats: bool,
 
-    /// Pula o raciocinio do RWKV-7 G1 (fecha um bloco <think></think vazio apos "Assistant:")
+    /// Pula o raciocinio do RWKV-7 G1 (fecha um bloco <think></think> vazio apos "Assistant:")
     #[arg(long, default_value_t = false)]
     pub no_think: bool,
 }
@@ -522,14 +510,7 @@ fn build_llm_backend(args: &AskArgs) -> Result<LlmBackend> {
 
 #[cfg(feature = "custom-rwkv")]
 fn build_rwkv_backend(rwkv_dir: &Path, args: &AskArgs) -> Result<LlmBackend> {
-    use ns_llm::rwkv7::DecodeMode;
-
     let max_new_tokens = usize::try_from(args.max_tokens).unwrap_or(256);
-    let decode_mode = match args.mode {
-        CliDecodeMode::Auto => DecodeMode::Auto,
-        CliDecodeMode::Json => DecodeMode::Json,
-        CliDecodeMode::Isa => DecodeMode::Isa,
-    };
     let llm = ns_llm::Rwkv7Llm::load_dir(rwkv_dir)
         .with_context(|| {
             format!(
@@ -537,8 +518,7 @@ fn build_rwkv_backend(rwkv_dir: &Path, args: &AskArgs) -> Result<LlmBackend> {
                 rwkv_dir.display()
             )
         })?
-        .with_max_new_tokens(max_new_tokens)
-        .with_decode_mode(decode_mode);
+        .with_max_new_tokens(max_new_tokens);
     Ok(LlmBackend::Rwkv7(llm))
 }
 

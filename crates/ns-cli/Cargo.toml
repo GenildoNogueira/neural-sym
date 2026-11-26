@@ -32,7 +32,3 @@ safetensors.workspace = true
 
 [lints]
 workspace = true
-
-[[example]]
-name = "eval_json_vs_isa"
-required-features = ["custom-rwkv", "tantivy-search"]

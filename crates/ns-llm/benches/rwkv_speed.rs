@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use llguidance::toktrie::TokenId;
+use ns_llm::quant::active_q4_backend;
 use ns_llm::{Rwkv7Config, Rwkv7Llm, Rwkv7State};
 use safetensors::Dtype;
 use safetensors::tensor::TensorView;
@@ -13,8 +13,6 @@ const BENCH_N_LAYERS: usize = 6;
 const BENCH_HEAD_DIM: usize = 64;
 const BENCH_FFN_DIM: usize = 768;
 const BENCH_LORA_DIM: usize = 32;
-const BENCH_COPY_DIM: usize = 64;
-const BENCH_COPY_MAX_LEN: usize = 512;
 
 const PREFILL_TOKENS: usize = 128;
 const PREFILL_RUNS: usize = 20;
@@ -49,30 +47,20 @@ impl StepStats {
     }
 }
 
-struct GuidedDecodeReport {
-    total_step: StepStats,
-    mask_only_mean_ms: f64,
-    sample_only_mean_ms: f64,
-    sampled_steps: usize,
-    ff_tokens: usize,
-    copy_bank_entries: usize,
-    ffn_sparsity_pct: f64,
-}
-
 struct ModelBenchReport {
     label: String,
     weight_bytes: usize,
     state_bytes: usize,
-    prefill: StepStats,
+    prefill_seq: StepStats,
+    prefill_chunk4: StepStats,
     hidden: StepStats,
     hidden_sparsity_pct: f64,
     head_full: StepStats,
     head_256: StepStats,
     head_32: StepStats,
     decode_full: StepStats,
-    decode_guided: GuidedDecodeReport,
-    e2e_ms: f64,
-    e2e_valid_json: usize,
+    decode_sparse_32: StepStats,
+    e2e_isa: Option<(f64, usize)>,
 }
 
 fn percentile(sorted: &[u128], pct: usize) -> u128 {
@@ -125,30 +113,8 @@ fn build_synthetic_vocab_bin(vocab_size: usize) -> Vec<u8> {
     }
 
     let anchors = [
-        "action",
-        "query_fact",
-        "search_facts",
-        "search_context",
-        "read_spans",
-        "traverse_graph",
-        "eval_math",
-        "check_logic",
-        "run_wasm_check",
-        "propose_answer",
-        "entity",
-        "relation",
-        "query",
-        "limit",
-        "span_ids",
-        "start_entity",
-        "max_hops",
-        "expression",
-        "smtlib2_script",
-        "wasm_wat_source",
-        "expected_stdout",
-        "text",
-        "cited_facts",
         "plano_pro",
+        "plano_enterprise",
         "preco_mensal",
         "cl_02",
         "cl_47",
@@ -182,7 +148,7 @@ fn build_synthetic_vocab_bin(vocab_size: usize) -> Vec<u8> {
     out
 }
 
-fn build_synthetic_rwkv7_model(copy_dim: usize) -> Result<Rwkv7Llm, Box<dyn std::error::Error>> {
+fn build_synthetic_rwkv7_model() -> Result<Rwkv7Llm, Box<dyn std::error::Error>> {
     let cfg = Rwkv7Config {
         arch: "rwkv7".to_owned(),
         vocab_size: BENCH_VOCAB_SIZE,
@@ -199,10 +165,10 @@ fn build_synthetic_rwkv7_model(copy_dim: usize) -> Result<Rwkv7Llm, Box<dyn std:
         layer_norm_eps: 1e-5,
         group_norm_eps: 64e-5,
         vocab_file: "vocab.bin".to_owned(),
-        copy_dim,
+        copy_dim: 0,
         isa_ptr_dim: 0,
         isa_num_vocab: 64,
-        copy_max_len: BENCH_COPY_MAX_LEN,
+        copy_max_len: 0,
         moe_num_experts: 0,
         moe_top_k: 2,
         moe_neuron_top_k: 0,
@@ -256,7 +222,6 @@ fn build_synthetic_rwkv7_model(copy_dim: usize) -> Result<Rwkv7Llm, Box<dyn std:
         bufs.push((format!("{name}.scale"), vec![out_dim], Dtype::F32, s_bytes));
     };
 
-    // Embeddings quantizados em I8 (mesmo formato do finetune_rwkv7_g1.py --quantize-emb-int8)
     push_q8_matrix(
         &mut buffers,
         &mut rng,
@@ -511,32 +476,6 @@ fn build_synthetic_rwkv7_model(copy_dim: usize) -> Result<Rwkv7Llm, Box<dyn std:
         cfg.d_model,
     );
 
-    if copy_dim > 0 {
-        push_q8_matrix(
-            &mut buffers,
-            &mut rng,
-            "copy_q.weight",
-            copy_dim,
-            cfg.d_model,
-        );
-        push_q8_matrix(
-            &mut buffers,
-            &mut rng,
-            "copy_k.weight",
-            copy_dim,
-            cfg.d_model,
-        );
-        push_f32(
-            &mut buffers,
-            &mut rng,
-            "copy_gate.weight",
-            vec![1, cfg.d_model + copy_dim],
-            0.05,
-            0.0,
-        );
-        push_f32(&mut buffers, &mut rng, "copy_gate.bias", vec![1], 0.01, 0.0);
-    }
-
     let mut views = HashMap::with_capacity(buffers.len());
     for (name, shape, dtype, bytes) in &buffers {
         views.insert(
@@ -554,20 +493,41 @@ fn make_prompt_tokens(vocab: usize, count: usize) -> Vec<usize> {
     (0..count).map(|i| 1 + ((i * 131 + 17) % span)).collect()
 }
 
-fn prefill_prompt_with_copy_bank(
+fn prefill_seq(
     model: &Rwkv7Llm,
     prompt_ids: &[usize],
     state: &mut Rwkv7State,
 ) -> Result<(), Box<dyn std::error::Error>> {
     model.forward_hidden(model.config().bos_token_id, state)?;
-    if let Some(&first_tok) = prompt_ids.first() {
-        model.record_copy_entry(state, TokenId::try_from(first_tok)?);
-    }
-    for (idx, &tok) in prompt_ids.iter().enumerate() {
+    for &tok in prompt_ids {
         model.forward_hidden(tok, state)?;
-        if let Some(&next_tok) = prompt_ids.get(idx + 1) {
-            model.record_copy_entry(state, TokenId::try_from(next_tok)?);
-        }
+    }
+    Ok(())
+}
+
+fn prefill_chunk4(
+    model: &Rwkv7Llm,
+    prompt_ids: &[usize],
+    state: &mut Rwkv7State,
+    x_outs_buf: &mut [f32],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let d = model.config().d_model;
+    model.forward_hidden(model.config().bos_token_id, state)?;
+
+    let chunks = prompt_ids.chunks_exact(4);
+    let rem = chunks.remainder();
+    for chunk in chunks {
+        let (s0, rest) = x_outs_buf.split_at_mut(d);
+        let (s1, rest) = rest.split_at_mut(d);
+        let (s2, s3) = rest.split_at_mut(d);
+        model.forward_hidden_chunk4(
+            [chunk[0], chunk[1], chunk[2], chunk[3]],
+            state,
+            [s0, s1, s2, s3],
+        )?;
+    }
+    for &tok in rem {
+        model.forward_hidden(tok, state)?;
     }
     Ok(())
 }
@@ -584,20 +544,45 @@ fn argmax_slice(logits: &[f32]) -> usize {
     best_idx
 }
 
-fn bench_prefill(model: &Rwkv7Llm) -> Result<StepStats, Box<dyn std::error::Error>> {
+fn bench_prefill_seq(model: &Rwkv7Llm) -> Result<StepStats, Box<dyn std::error::Error>> {
     let prompt_ids = make_prompt_tokens(model.config().vocab_size, PREFILL_TOKENS);
-    let mut warmup_state = Rwkv7State::new(model.config());
-    prefill_prompt_with_copy_bank(model, &prompt_ids[..16], &mut warmup_state)?;
+    let mut state = Rwkv7State::new(model.config());
+    prefill_seq(model, &prompt_ids[..16], &mut state)?;
 
     let mut per_run_per_token_ns = Vec::with_capacity(PREFILL_RUNS);
     let total_start = Instant::now();
 
     for _ in 0..PREFILL_RUNS {
-        let mut state = Rwkv7State::new(model.config());
+        state.reset_recurrent_zero();
         let t0 = Instant::now();
-        prefill_prompt_with_copy_bank(model, &prompt_ids, &mut state)?;
+        prefill_seq(model, &prompt_ids, &mut state)?;
         let elapsed_ns = t0.elapsed().as_nanos();
         black_box(&state);
+        per_run_per_token_ns.push(elapsed_ns / (PREFILL_TOKENS as u128));
+    }
+
+    Ok(StepStats::from_nanos(
+        per_run_per_token_ns,
+        total_start.elapsed(),
+        PREFILL_RUNS * PREFILL_TOKENS,
+    ))
+}
+
+fn bench_prefill_chunk4(model: &Rwkv7Llm) -> Result<StepStats, Box<dyn std::error::Error>> {
+    let prompt_ids = make_prompt_tokens(model.config().vocab_size, PREFILL_TOKENS);
+    let mut state = Rwkv7State::new(model.config());
+    let mut x_outs = vec![0.0_f32; 4 * model.config().d_model];
+    prefill_chunk4(model, &prompt_ids[..16], &mut state, &mut x_outs)?;
+
+    let mut per_run_per_token_ns = Vec::with_capacity(PREFILL_RUNS);
+    let total_start = Instant::now();
+
+    for _ in 0..PREFILL_RUNS {
+        state.reset_recurrent_zero();
+        let t0 = Instant::now();
+        prefill_chunk4(model, &prompt_ids, &mut state, &mut x_outs)?;
+        let elapsed_ns = t0.elapsed().as_nanos();
+        black_box((&state, &x_outs));
         per_run_per_token_ns.push(elapsed_ns / (PREFILL_TOKENS as u128));
     }
 
@@ -612,7 +597,8 @@ fn bench_forward_hidden(model: &Rwkv7Llm) -> Result<(StepStats, f64), Box<dyn st
     let vocab = model.config().vocab_size;
     let prompt_ids = make_prompt_tokens(vocab, PREFILL_TOKENS);
     let mut state = Rwkv7State::new(model.config());
-    prefill_prompt_with_copy_bank(model, &prompt_ids, &mut state)?;
+    let mut x_outs = vec![0.0_f32; 4 * model.config().d_model];
+    prefill_chunk4(model, &prompt_ids, &mut state, &mut x_outs)?;
 
     let mut samples_ns = Vec::with_capacity(HIDDEN_STEPS);
     let total_start = Instant::now();
@@ -696,7 +682,8 @@ fn bench_head_sparse_subset(
 fn bench_decode_full(model: &Rwkv7Llm) -> Result<StepStats, Box<dyn std::error::Error>> {
     let prompt_ids = make_prompt_tokens(model.config().vocab_size, PREFILL_TOKENS);
     let mut state = Rwkv7State::new(model.config());
-    prefill_prompt_with_copy_bank(model, &prompt_ids, &mut state)?;
+    let mut x_outs = vec![0.0_f32; 4 * model.config().d_model];
+    prefill_chunk4(model, &prompt_ids, &mut state, &mut x_outs)?;
 
     let mut logits = vec![0.0_f32; model.config().vocab_size];
     let mut token = 1_usize;
@@ -720,97 +707,57 @@ fn bench_decode_full(model: &Rwkv7Llm) -> Result<StepStats, Box<dyn std::error::
     ))
 }
 
-fn bench_decode_llguidance(
+fn bench_decode_sparse(
     model: &Rwkv7Llm,
-) -> Result<GuidedDecodeReport, Box<dyn std::error::Error>> {
-    let eos_u32 = TokenId::try_from(model.config().eos_token_id)?;
-    let prompt_ids = make_prompt_tokens(model.config().vocab_size, PREFILL_TOKENS);
+    allowed_count: usize,
+) -> Result<StepStats, Box<dyn std::error::Error>> {
+    let vocab = model.config().vocab_size;
+    let effective = allowed_count.min(vocab).max(1);
+    let step = (vocab / effective).max(1);
+    let rows: Vec<usize> = (0..effective).map(|i| (i * step) % vocab).collect();
 
+    let prompt_ids = make_prompt_tokens(vocab, PREFILL_TOKENS);
     let mut state = Rwkv7State::new(model.config());
-    prefill_prompt_with_copy_bank(model, &prompt_ids, &mut state)?;
-    let copy_bank_entries = state.copy_bank_len();
+    let mut x_outs = vec![0.0_f32; 4 * model.config().d_model];
+    prefill_chunk4(model, &prompt_ids, &mut state, &mut x_outs)?;
 
-    let mut matcher = model.new_grammar_matcher()?;
+    let mut token = 1_usize;
     let mut samples_ns = Vec::with_capacity(DECODE_STEPS);
-    let mut mask_total_ns: u128 = 0;
-    let mut sample_total_ns: u128 = 0;
-    let mut decode_active_ns: u128 = 0;
-    let mut sampled_steps: usize = 0;
-    let mut ff_tokens: usize = 0;
-    let mut total_tokens_emitted: usize = 0;
+    let total_start = Instant::now();
 
-    while total_tokens_emitted < DECODE_STEPS {
-        if matcher.is_stopped() {
-            matcher = model.new_grammar_matcher()?;
-            state = Rwkv7State::new(model.config());
-            prefill_prompt_with_copy_bank(model, &prompt_ids, &mut state)?;
-        }
-
-        let step_t0 = Instant::now();
-
-        let mask_t0 = Instant::now();
-        let mask = matcher.compute_mask()?;
-        mask_total_ns += mask_t0.elapsed().as_nanos();
-
-        let sample_t0 = Instant::now();
-        let Some((next_tok, p_copy)) = model.sample_with_copy_gate(&mut state, &mask) else {
-            return Err("llguidance mask allowed zero tokens".into());
-        };
-        sample_total_ns += sample_t0.elapsed().as_nanos();
-        black_box(p_copy);
-
-        matcher.consume_token(next_tok)?;
-        sampled_steps += 1;
-
-        if next_tok != eos_u32 {
-            let next_usize = usize::try_from(next_tok)?;
-            model.forward_hidden(next_usize, &mut state)?;
-            total_tokens_emitted += 1;
-
-            for ff_tok in matcher.consume_ff_tokens() {
-                if ff_tok == eos_u32 || total_tokens_emitted >= DECODE_STEPS {
-                    break;
-                }
-                let ff_usize = usize::try_from(ff_tok)?;
-                model.forward_hidden(ff_usize, &mut state)?;
-                ff_tokens += 1;
-                total_tokens_emitted += 1;
-            }
-        }
-
-        let step_ns = step_t0.elapsed().as_nanos();
-        decode_active_ns += step_ns;
-        samples_ns.push(step_ns);
-        black_box(next_tok);
+    for _ in 0..DECODE_STEPS {
+        let t0 = Instant::now();
+        model.forward_hidden(token, &mut state)?;
+        let winner = model.sample_subset_from_hidden(&mut state, &rows);
+        token = winner.and_then(|id| usize::try_from(id).ok()).unwrap_or(1);
+        samples_ns.push(t0.elapsed().as_nanos());
+        black_box(token);
     }
 
-    let active_duration = Duration::from_nanos(u64::try_from(decode_active_ns).unwrap_or(u64::MAX));
-    let total_step =
-        StepStats::from_nanos(samples_ns, active_duration, total_tokens_emitted.max(1));
-    let denom = sampled_steps.max(1) as f64;
-
-    Ok(GuidedDecodeReport {
-        total_step,
-        mask_only_mean_ms: (mask_total_ns as f64) / denom / 1_000_000.0,
-        sample_only_mean_ms: (sample_total_ns as f64) / denom / 1_000_000.0,
-        sampled_steps,
-        ff_tokens,
-        copy_bank_entries,
-        ffn_sparsity_pct: state.ffn_sparsity_ratio() * 100.0,
-    })
+    Ok(StepStats::from_nanos(
+        samples_ns,
+        total_start.elapsed(),
+        DECODE_STEPS,
+    ))
 }
 
-fn bench_e2e_action(model: &Rwkv7Llm) -> Result<(f64, usize), Box<dyn std::error::Error>> {
+fn bench_e2e_isa(model: &Rwkv7Llm) -> Option<(f64, usize)> {
+    if !model.has_isa_head() {
+        return None;
+    }
+
     let prompt = concat!(
-        "USER: Existe conflito entre a clausula 2 e a clausula 47?\n",
-        "TOOL: {\"status\":\"ok\",\"spans\":[{\"id\":\"cl_02\",\"text\":\"Prazo maximo 15 dias.\"},",
-        "{\"id\":\"cl_47\",\"text\":\"Entrega especial em 30 dias.\"}]}\n"
+        "USER: Qual o(a) preco_mensal de plano_enterprise?\n",
+        "TOOL: {\"status\":\"found\",\"fact\":{\"id\":\"fact-inedito-9842\",",
+        "\"subject\":\"plano_enterprise\",\"relation\":\"preco_mensal\",",
+        "\"object\":\"749.50\",\"source_ref\":\"bench\"}}\n"
     );
+
     let mut ok_count = 0_usize;
     let t0 = Instant::now();
-
     for _ in 0..E2E_RUNS {
-        let action = model.generate_action_from_prompt(prompt);
+        model.clear_prefix_cache();
+        let action = model.generate_action_isa(prompt, true);
         if action.is_ok() {
             ok_count += 1;
         }
@@ -818,7 +765,7 @@ fn bench_e2e_action(model: &Rwkv7Llm) -> Result<(f64, usize), Box<dyn std::error
     }
 
     let avg_ms = t0.elapsed().as_secs_f64() * 1_000.0 / (E2E_RUNS as f64);
-    Ok((avg_ms, ok_count))
+    Some((avg_ms, ok_count))
 }
 
 fn run_suite(
@@ -826,29 +773,30 @@ fn run_suite(
     model: &Rwkv7Llm,
 ) -> Result<ModelBenchReport, Box<dyn std::error::Error>> {
     let state = Rwkv7State::new(model.config());
-    let prefill = bench_prefill(model)?;
+    let prefill_seq = bench_prefill_seq(model)?;
+    let prefill_chunk4 = bench_prefill_chunk4(model)?;
     let (hidden, hidden_sparsity_pct) = bench_forward_hidden(model)?;
     let head_full = bench_head_full(model)?;
     let head_256 = bench_head_sparse_subset(model, 256)?;
     let head_32 = bench_head_sparse_subset(model, 32)?;
     let decode_full = bench_decode_full(model)?;
-    let decode_guided = bench_decode_llguidance(model)?;
-    let (e2e_ms, e2e_valid_json) = bench_e2e_action(model)?;
+    let decode_sparse_32 = bench_decode_sparse(model, 32)?;
+    let e2e_isa = bench_e2e_isa(model);
 
     Ok(ModelBenchReport {
         label,
         weight_bytes: model.total_weight_bytes(),
         state_bytes: state.state_bytes(),
-        prefill,
+        prefill_seq,
+        prefill_chunk4,
         hidden,
         hidden_sparsity_pct,
         head_full,
         head_256,
         head_32,
         decode_full,
-        decode_guided,
-        e2e_ms,
-        e2e_valid_json,
+        decode_sparse_32,
+        e2e_isa,
     })
 }
 
@@ -859,21 +807,27 @@ fn print_row(label: &str, stats: StepStats) {
     );
 }
 
-fn print_single_report(r: &ModelBenchReport, cfg: &Rwkv7Config) {
+fn print_report(r: &ModelBenchReport, cfg: &Rwkv7Config) {
+    let chunk4_speedup = r.prefill_seq.mean_ms / r.prefill_chunk4.mean_ms.max(1e-9);
+
     println!();
     println!(
         "================================================================================================="
     );
-    println!("  NeuroSym RWKV-7 Goose CPU Speed Benchmark | {}", r.label);
     println!(
-        "  Perfil: d={} | L={} | H={}x{} | ffn={} | V={} | copy_dim={} | pesos: {:.2} MiB | estado O(1): {:.1} KiB",
+        "  NeuroSym RWKV-7 Goose CPU Speed Benchmark | {} (Q4: {})",
+        r.label,
+        active_q4_backend()
+    );
+    println!(
+        "  Perfil: d={} | L={} | H={}x{} | ffn={} | V={} | isa={} | pesos: {:.2} MiB | estado O(1): {:.1} KiB",
         cfg.d_model,
         cfg.n_layers,
         cfg.d_model / cfg.head_dim.max(1),
         cfg.head_dim,
         cfg.ffn_dim,
         cfg.vocab_size,
-        cfg.copy_dim,
+        cfg.isa_ptr_dim > 0,
         (r.weight_bytes as f64) / (1024.0 * 1024.0),
         (r.state_bytes as f64) / 1024.0,
     );
@@ -887,7 +841,8 @@ fn print_single_report(r: &ModelBenchReport, cfg: &Rwkv7Config) {
     println!(
         "---------------------------------------------+-------------+-------------+-------------+-----------------"
     );
-    print_row("Prefill (128 tok + Copy Bank, sem head)", r.prefill);
+    print_row("Prefill sequencial (128 tok, 1 a 1)", r.prefill_seq);
+    print_row("Prefill chunk4 (128 tok, matmul4_into)", r.prefill_chunk4);
     print_row("forward_hidden RWKV-7 (estado matricial)", r.hidden);
     print_row("head completa (V linhas + argmax)", r.head_full);
     print_row("head esparsa (256 linhas)", r.head_256);
@@ -897,98 +852,22 @@ fn print_single_report(r: &ModelBenchReport, cfg: &Rwkv7Config) {
     );
     print_row("Decode denso (hidden + head completa)", r.decode_full);
     print_row(
-        "Decode llguidance (hidden + mask + sample)",
-        r.decode_guided.total_step,
+        "Decode esparso (hidden + head 32 linhas)",
+        r.decode_sparse_32,
     );
     println!(
         "================================================================================================="
     );
     println!(
-        "  llguidance: mask = {:.3} ms | sample = {:.3} ms | copy_bank = {} | sampled = {} | ff = {}",
-        r.decode_guided.mask_only_mean_ms,
-        r.decode_guided.sample_only_mean_ms,
-        r.decode_guided.copy_bank_entries,
-        r.decode_guided.sampled_steps,
-        r.decode_guided.ff_tokens,
+        "  Ganho chunk4 vs sequencial: {:.2}x | FFN ReLU² esparsa: {:.1}% colunas puladas",
+        chunk4_speedup, r.hidden_sparsity_pct
     );
-    println!(
-        "  FFN ReLU² esparsa: {:.1}% colunas puladas (hidden) | {:.1}% (decode guiado)",
-        r.hidden_sparsity_pct, r.decode_guided.ffn_sparsity_pct
-    );
-    println!(
-        "  E2E generate_action_from_prompt: média = {:.2} ms | JSON LlmAction válido = {}/{E2E_RUNS}",
-        r.e2e_ms, r.e2e_valid_json
-    );
-    println!(
-        "================================================================================================="
-    );
-}
-
-fn print_comparison(base: &ModelBenchReport, with_copy: &ModelBenchReport) {
-    let prefill_delta = with_copy.prefill.p50_ms - base.prefill.p50_ms;
-    let sample_delta =
-        with_copy.decode_guided.sample_only_mean_ms - base.decode_guided.sample_only_mean_ms;
-    let decode_delta =
-        with_copy.decode_guided.total_step.mean_ms - base.decode_guided.total_step.mean_ms;
-    let decode_pct = (decode_delta / base.decode_guided.total_step.mean_ms.max(1e-9)) * 100.0;
-    let weights_kib = ((with_copy.weight_bytes as f64) - (base.weight_bytes as f64)) / 1024.0;
-
-    println!();
-    println!(
-        "================================================================================================="
-    );
-    println!(
-        "  COMPARATIVO RWKV-7 GOOSE: baseline (copy_dim=0) vs Pointer/Copy Gate (copy_dim=64)"
-    );
-    println!(
-        "================================================================================================="
-    );
-    println!(
-        "{:<42} | {:>14} | {:>14} | {:>18}",
-        "Métrica (128 tokens no contexto)", "copy_dim = 0", "copy_dim = 64", "Delta"
-    );
-    println!(
-        "-------------------------------------------+----------------+----------------+-------------------"
-    );
-    println!(
-        "{:<42} | {:>11.3} ms | {:>11.3} ms | {:>+8.3} ms ({:>+5.0} us)",
-        "Prefill por token (p50)",
-        base.prefill.p50_ms,
-        with_copy.prefill.p50_ms,
-        prefill_delta,
-        prefill_delta * 1_000.0,
-    );
-    println!(
-        "{:<42} | {:>11.3} ms | {:>11.3} ms | {:>+8.3} ms ({:>+5.0} us)",
-        "Sample (head esparsa vs + Copy Gate)",
-        base.decode_guided.sample_only_mean_ms,
-        with_copy.decode_guided.sample_only_mean_ms,
-        sample_delta,
-        sample_delta * 1_000.0,
-    );
-    println!(
-        "{:<42} | {:>11.3} ms | {:>11.3} ms | {:>+8.3} ms ({:>+5.1}%)",
-        "Decode guiado por passo (média)",
-        base.decode_guided.total_step.mean_ms,
-        with_copy.decode_guided.total_step.mean_ms,
-        decode_delta,
-        decode_pct,
-    );
-    println!(
-        "{:<42} | {:>8.1} tok/s | {:>8.1} tok/s | {:>+11.1} tok/s",
-        "Throughput decode guiado (llguidance)",
-        base.decode_guided.total_step.tok_per_sec,
-        with_copy.decode_guided.total_step.tok_per_sec,
-        with_copy.decode_guided.total_step.tok_per_sec - base.decode_guided.total_step.tok_per_sec,
-    );
-    println!(
-        "-------------------------------------------+----------------+----------------+-------------------"
-    );
-    println!(
-        "  Memória extra do Copy Gate: {:+.1} KiB de pesos W8 | estado O(1): {:.1} KiB fixos",
-        weights_kib,
-        (with_copy.state_bytes as f64) / 1024.0
-    );
+    if let Some((avg_ms, ok_count)) = r.e2e_isa {
+        println!(
+            "  E2E generate_action_isa (frio): média = {:.2} ms | ações válidas = {ok_count}/{E2E_RUNS}",
+            avg_ms
+        );
+    }
     println!(
         "================================================================================================="
     );
@@ -998,22 +877,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(dir) = std::env::var("NS_RWKV_BENCH_DIR") {
         let model = Rwkv7Llm::load_dir(&dir)?;
         let report = run_suite(format!("modelo real ({dir})"), &model)?;
-        print_single_report(&report, model.config());
+        print_report(&report, model.config());
         return Ok(());
     }
 
-    let base_model = build_synthetic_rwkv7_model(0)?;
-    let copy_model = build_synthetic_rwkv7_model(BENCH_COPY_DIM)?;
-
-    let base_report = run_suite("RWKV-7 Goose baseline (copy_dim=0)".to_owned(), &base_model)?;
-    let copy_report = run_suite(
-        "RWKV-7 Goose + Pointer/Copy Gate (copy_dim=64)".to_owned(),
-        &copy_model,
-    )?;
-
-    print_single_report(&base_report, base_model.config());
-    print_single_report(&copy_report, copy_model.config());
-    print_comparison(&base_report, &copy_report);
-
+    let model = build_synthetic_rwkv7_model()?;
+    let report = run_suite("RWKV-7 Goose sintético (ISA/chunk4)".to_owned(), &model)?;
+    print_report(&report, model.config());
     Ok(())
 }

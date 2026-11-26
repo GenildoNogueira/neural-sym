@@ -37,37 +37,27 @@ pub enum QuantFormat {
 }
 
 impl QuantFormat {
-    /// Lê a variável de ambiente `NS_WEIGHT_QUANT` (`q4` / `q4_all` / `q4_large` / `w8`).
+    /// Lê a variável de ambiente `NS_WEIGHT_QUANT` (`w8` desativa Q4; padrão usa Q4 em matrizes grandes).
     #[must_use]
     pub fn from_env() -> Self {
         match std::env::var("NS_WEIGHT_QUANT") {
-            Ok(val)
-                if val.eq_ignore_ascii_case("q4")
-                    || val.eq_ignore_ascii_case("q4_all")
-                    || val.eq_ignore_ascii_case("q4_large") =>
-            {
-                Self::Q4
-            }
-            _ => Self::W8,
+            Ok(val) if val.eq_ignore_ascii_case("w8") => Self::W8,
+            _ => Self::Q4,
         }
     }
 
     /// Precisão mista por tamanho de matriz:
-    /// - `q4_large`: Q4 apenas em matrizes `>= 1M` pesos (`cm.key`, `head`); Time-Mixing 100% W8.
-    /// - `q4`: Q4 em matrizes `>= 512k` pesos (`tm.proj`, `cm.key`, `head`); LoRAs pequenos em W8.
+    /// - padrão / `q4_large`: Q4 em matrizes `>= 1M` pesos (`cm.key`, `head`, `tm.proj` 1.5B+);
+    ///   Time-Mixing 0.1B e LoRAs pequenos permanecem em W8.
+    /// - `q4`: Q4 em matrizes `>= 512k` pesos.
     /// - `q4_all`: força Q4 em todas as matrizes.
+    /// - `w8`: força W8 em todas as matrizes.
     #[must_use]
     pub fn from_env_for_shape(out_dim: usize, in_dim: usize) -> Self {
         let elements = out_dim.saturating_mul(in_dim);
         match std::env::var("NS_WEIGHT_QUANT") {
+            Ok(val) if val.eq_ignore_ascii_case("w8") => Self::W8,
             Ok(val) if val.eq_ignore_ascii_case("q4_all") => Self::Q4,
-            Ok(val) if val.eq_ignore_ascii_case("q4_large") => {
-                if elements >= Q4_LARGE_MIN_ELEMENTS {
-                    Self::Q4
-                } else {
-                    Self::W8
-                }
-            }
             Ok(val) if val.eq_ignore_ascii_case("q4") => {
                 if elements >= Q4_MIXED_MIN_ELEMENTS {
                     Self::Q4
@@ -75,7 +65,13 @@ impl QuantFormat {
                     Self::W8
                 }
             }
-            _ => Self::W8,
+            _ => {
+                if elements >= Q4_LARGE_MIN_ELEMENTS {
+                    Self::Q4
+                } else {
+                    Self::W8
+                }
+            }
         }
     }
 }
@@ -402,12 +398,7 @@ impl QuantizedMatrix {
 
     /// Calcula `outs[k] = W * xs[k]` para **4 trajetórias simultâneas (`M × 4`)**
     /// lendo os pesos da matriz **uma única vez da RAM** (base do Best-of-N sem custo extra de banda).
-    pub fn matmul4_into(
-        &self,
-        xs: [&[f32]; 4],
-        q_inputs: [&mut [i8]; 4],
-        outs: [&mut [f32]; 4],
-    ) {
+    pub fn matmul4_into(&self, xs: [&[f32]; 4], q_inputs: [&mut [i8]; 4], outs: [&mut [f32]; 4]) {
         let in_dim = self.in_dim;
         debug_assert!(xs.iter().all(|x| x.len() == in_dim));
         debug_assert!(outs.iter().all(|o| o.len() == self.out_dim));
@@ -504,20 +495,22 @@ impl QuantizedMatrix {
                             )
                                 .into_par_iter()
                                 .enumerate()
-                                .for_each(|(chunk_idx, (c0, c1, c2, c3))| {
-                                    let row0 = chunk_idx * PARALLEL_ROW_CHUNK;
-                                    compute_q4_row_range_x4(
-                                        blocks,
-                                        n_blk,
-                                        row0,
-                                        [c0, c1, c2, c3],
-                                        qx_refs,
-                                        x_scales,
-                                        x_bias,
-                                        in_dim,
-                                        use_nta,
-                                    );
-                                });
+                                .for_each(
+                                    |(chunk_idx, (c0, c1, c2, c3))| {
+                                        let row0 = chunk_idx * PARALLEL_ROW_CHUNK;
+                                        compute_q4_row_range_x4(
+                                            blocks,
+                                            n_blk,
+                                            row0,
+                                            [c0, c1, c2, c3],
+                                            qx_refs,
+                                            x_scales,
+                                            x_bias,
+                                            in_dim,
+                                            use_nta,
+                                        );
+                                    },
+                                );
                         } else {
                             compute_q4_row_range_x4(
                                 blocks,
@@ -633,26 +626,6 @@ impl QuantizedMatrix {
         };
 
         best.and_then(|(row, _)| TokenId::try_from(row).ok())
-    }
-
-    /// Projeção esparsa mascarada para a camada `head` usando o bitset `SimpleVob` do `llguidance`.
-    pub fn argmax_masked(
-        &self,
-        x: &[f32],
-        mask: &SimpleVob,
-        q_input_scratch: &mut [i8],
-        allowed_scratch: &mut Vec<usize>,
-    ) -> Option<TokenId> {
-        allowed_scratch.clear();
-        for row in 0..self.out_dim {
-            let Ok(tok_id) = TokenId::try_from(row) else {
-                break;
-            };
-            if mask.is_allowed(tok_id) {
-                allowed_scratch.push(row);
-            }
-        }
-        self.argmax_rows(x, allowed_scratch, q_input_scratch)
     }
 
     /// Calcula os logits **apenas** para as linhas em `rows`, gravando o resultado
@@ -856,8 +829,18 @@ where
 
         f(
             [q0, q1, q2, q3],
-            [&s0[..n_blocks], &s1[..n_blocks], &s2[..n_blocks], &s3[..n_blocks]],
-            [&b0[..n_blocks], &b1[..n_blocks], &b2[..n_blocks], &b3[..n_blocks]],
+            [
+                &s0[..n_blocks],
+                &s1[..n_blocks],
+                &s2[..n_blocks],
+                &s3[..n_blocks],
+            ],
+            [
+                &b0[..n_blocks],
+                &b1[..n_blocks],
+                &b2[..n_blocks],
+                &b3[..n_blocks],
+            ],
             [z0, z1, z2, z3],
         )
     } else {
