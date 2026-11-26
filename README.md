@@ -531,42 +531,6 @@ cargo run --release -p ns-llm --features custom-rwkv --example isa_compression
 cargo run --release -p ns-cli --features custom-rwkv --example eval_json_vs_isa
 ```
 
-### 5.4 Outros comandos úteis do CLI
-
-```bash
-# Fatos e índice invertido Tantivy (padrão: indexed-redb)
-cargo run -p ns-cli -- fact add --id f1 --subject plano_pro --relation preco_mensal --object 199.90
-cargo run -p ns-cli -- fact get --entity plano_pro --relation preco_mensal
-cargo run -p ns-cli -- fact search --query "plano_"
-cargo run -p ns-cli -- fact traverse --start plano_pro --max-hops 2
-cargo run -p ns-cli -- fact rebuild-index
-
-# Dataset verificado sem os cenários de erro + recuperação REPAIR REQUIRED
-cargo run --release -p ns-cli -- dataset generate --seed-synthetic 80 --no-repairs
-
-# Auditoria de documento longo (ex.: contrato de 10 páginas indexado em RAM)
-RUSTFLAGS="-C target-cpu=native" cargo run --release -p ns-cli -- ask \
-  --rwkv-dir artifacts/rwkv7_g1_01b_ns \
-  --context-file contrato.txt \
-  --prompt "Existe conflito entre o prazo da cláusula 2 e a cláusula 47?" \
-  --require-citations \
-  --show-audit
-
-# Simular o LLM sem modelo (testes determinísticos com MockLlm)
-cargo run -p ns-cli -- ask --prompt "teste" --actions-json '[...]'
-
-# JSON Schema de LlmAction usado no constrained decoding
-cargo run -p ns-cli -- schema
-
-# Aritmética decimal exata e provas formais com Z3
-cargo run -p ns-cli -- eval "(199.90 * 3) * (1 + 0.15)"
-cargo run -p ns-cli --features z3-solver -- logic --script "
-  (declare-const desconto Real)
-  (assert (! (<= desconto 0.30) :named limite_politica))
-  (assert (! (= desconto 0.45) :named desconto_proposto))
-"
-```
-
 ---
 
 ## 6. Solução de Problemas Comuns
