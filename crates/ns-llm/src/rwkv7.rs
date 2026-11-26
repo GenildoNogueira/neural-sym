@@ -2188,7 +2188,17 @@ impl Rwkv7Llm {
                 }
 
                 Expect::Lit => {
-                    let text = self.decode_isa_literal(isa, state, &mut logits_buf)?;
+                    let text = if op == Op::ProposeAnswer {
+                        // Placeholder: o texto é renderizado depois, a partir do FactId citado.
+                        // Mantém o estado recorrente "fechando" o literal, sem tocar na head 65k.
+                        self.forward_hidden_vec(
+                            &isa.ctl_emb[CTL_LIT_CLOSE * d..(CTL_LIT_CLOSE + 1) * d],
+                            state,
+                        )?;
+                        String::new()
+                    } else {
+                        self.decode_isa_literal(isa, state, &mut logits_buf)?
+                    };
                     syms.push(Sym::Lit(text));
                 }
 
