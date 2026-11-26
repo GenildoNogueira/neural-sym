@@ -907,6 +907,7 @@ struct PrefixStateCache {
     h_prefill: Vec<f32>,
     token_byte_ends: Vec<usize>,
     checkpoint_x_out: Vec<f32>,
+    copy_start_idx: usize,
     copy_keys: Vec<f32>,
     copy_tokens: Vec<TokenId>,
     working_state: Option<Rwkv7State>,
@@ -1799,8 +1800,9 @@ impl Rwkv7Llm {
             .unwrap_or_else(|| Rwkv7State::new(&self.cfg));
 
         let copy_ok = self.copy_gate.is_none()
-            || (record_from == 0
-                && cache.copy_tokens.len() == cache.tokens.len()
+            || (record_from >= cache.copy_start_idx
+                && cache.copy_tokens.len()
+                    == cache.tokens.len().saturating_sub(cache.copy_start_idx)
                 && cache.checkpoint_x_out.len() == self.cfg.d_model);
         let cache_hit = !cache.tokens.is_empty()
             && cache.layers_snapshot.is_some()
@@ -1818,14 +1820,25 @@ impl Rwkv7Llm {
             state.read_ffn_bytes = 0;
             state.scratch.copy_keys.clear();
             state.scratch.copy_tokens.clear();
-            if self.copy_gate.is_some() {
-                state.scratch.copy_keys.extend_from_slice(&cache.copy_keys);
-                state
-                    .scratch
-                    .copy_tokens
-                    .extend_from_slice(&cache.copy_tokens);
-                state.scratch.x_out.copy_from_slice(&cache.checkpoint_x_out);
-                if let Some(&next_tok) = prompt_ids.get(n) {
+            if let Some(ref cg) = self.copy_gate {
+                if record_from < n {
+                    let skip = record_from.saturating_sub(cache.copy_start_idx);
+                    state
+                        .scratch
+                        .copy_keys
+                        .extend_from_slice(&cache.copy_keys[skip * cg.copy_dim..]);
+                    state
+                        .scratch
+                        .copy_tokens
+                        .extend_from_slice(&cache.copy_tokens[skip..]);
+                }
+                if n >= record_from
+                    && let Some(&next_tok) = prompt_ids.get(n)
+                {
+                    state
+                        .scratch
+                        .x_out
+                        .copy_from_slice(&cache.checkpoint_x_out);
                     self.record_copy_entry(&mut state, next_tok);
                 }
             }
@@ -1873,9 +1886,11 @@ impl Rwkv7Llm {
                 cache.h_prefill.clear();
                 cache.token_byte_ends.clear();
                 cache.checkpoint_x_out.clear();
+                cache.copy_start_idx = 0;
                 cache.copy_keys.clear();
                 cache.copy_tokens.clear();
-                if self.copy_gate.is_some() && record_from == 0 {
+                if self.copy_gate.is_some() {
+                    cache.copy_start_idx = record_from.min(checkpoint_len);
                     cache
                         .checkpoint_x_out
                         .extend_from_slice(&state.scratch.x_out);
@@ -2081,6 +2096,7 @@ impl Rwkv7Llm {
                     .token_byte_ends
                     .extend_from_slice(&token_byte_ends[..checkpoint_len]);
                 cache.checkpoint_x_out.clear();
+                cache.copy_start_idx = 0;
                 cache.copy_keys.clear();
                 cache.copy_tokens.clear();
             }
@@ -2423,6 +2439,7 @@ impl Rwkv7Llm {
         cache.h_prefill.clear();
         cache.token_byte_ends.clear();
         cache.checkpoint_x_out.clear();
+        cache.copy_start_idx = 0;
         cache.copy_keys.clear();
         cache.copy_tokens.clear();
     }

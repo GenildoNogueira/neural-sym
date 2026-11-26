@@ -15,6 +15,7 @@ pub enum AuditOutcome {
     VerifierRejected { reason: String },
     MissingRequiredCitations,
     CitationRejected { missing: Vec<FactId> },
+    AnswerContentRejected { reason: String },
     AnswerVerified,
     ContextSearched { query: String, count: usize },
     SpansRead { span_ids: Vec<FactId> },
@@ -29,6 +30,7 @@ impl AuditOutcome {
             self,
             Self::CitationRejected { .. }
                 | Self::MissingRequiredCitations
+                | Self::AnswerContentRejected { .. }
                 | Self::VerifierRejected { .. }
                 | Self::SpanNotFound { .. }
         )

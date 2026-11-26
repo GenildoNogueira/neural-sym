@@ -21,6 +21,9 @@ const PARALLEL_SPARSE_THRESHOLD: usize = 1_024;
 /// Acima de 2 MiB, ativa `PREFETCHNTA` no kernel SIMD para proteger o `Rwkv7State` na L3.
 const NTA_PREFETCH_MIN_BYTES: usize = 2 * 1024 * 1024;
 
+const Q4_MIXED_MIN_ELEMENTS: usize = 512 * 1024;
+const Q4_LARGE_MIN_ELEMENTS: usize = 1024 * 1024;
+
 /// Formato de quantização dos pesos lineares em RAM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum QuantFormat {
@@ -37,6 +40,33 @@ impl QuantFormat {
     pub fn from_env() -> Self {
         match std::env::var("NS_WEIGHT_QUANT") {
             Ok(val) if val.eq_ignore_ascii_case("q4") => Self::Q4,
+            _ => Self::W8,
+        }
+    }
+
+    /// Resolve o formato por matriz a partir de `NS_WEIGHT_QUANT`:
+    /// - `q4_large`: Q4 só em matrizes >= 1M pesos (`cm.key`, `head`); Time-Mixing fica 100% W8.
+    /// - `q4`: Q4 em matrizes >= 512k pesos (`tm.proj`, `cm.key`, `head`); LoRAs pequenos ficam W8.
+    /// - `q4_all`: força Q4 em todas as matrizes.
+    #[must_use]
+    pub fn from_env_for_shape(out_dim: usize, in_dim: usize) -> Self {
+        let elements = out_dim.saturating_mul(in_dim);
+        match std::env::var("NS_WEIGHT_QUANT") {
+            Ok(val) if val.eq_ignore_ascii_case("q4_all") => Self::Q4,
+            Ok(val) if val.eq_ignore_ascii_case("q4_large") => {
+                if elements >= Q4_LARGE_MIN_ELEMENTS {
+                    Self::Q4
+                } else {
+                    Self::W8
+                }
+            }
+            Ok(val) if val.eq_ignore_ascii_case("q4") => {
+                if elements >= Q4_MIXED_MIN_ELEMENTS {
+                    Self::Q4
+                } else {
+                    Self::W8
+                }
+            }
             _ => Self::W8,
         }
     }
@@ -76,7 +106,8 @@ impl QuantizedMatrix {
         out_dim: usize,
         in_dim: usize,
     ) -> Result<Self, LlmError> {
-        Self::load_from_safetensors_with_format(st, name, out_dim, in_dim, QuantFormat::from_env())
+        let format = QuantFormat::from_env_for_shape(out_dim, in_dim);
+        Self::load_from_safetensors_with_format(st, name, out_dim, in_dim, format)
     }
 
     /// Carrega uma matriz do `.safetensors` no formato explícito (`W8` ou `Q4`).

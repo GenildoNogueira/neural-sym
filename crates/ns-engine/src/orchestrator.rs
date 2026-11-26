@@ -1,8 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ns_core::action::LlmAction;
 use ns_core::error::VerificationError;
-use ns_core::fact::{FactId, Message};
+use ns_core::fact::{Fact, FactId, Message};
 use ns_core::ports::{
     ConstrainedLlm, DeterministicMemory, DocumentContext, LogicProof, NoDocumentContext,
     SymbolicVerifier,
@@ -22,6 +22,7 @@ pub struct Orchestrator<L, M, V> {
     max_steps: u8,
     require_citations: bool,
     shortlist_limit: u8,
+    verify_answer_content: bool,
 }
 
 impl<L, M, V> Orchestrator<L, M, V>
@@ -39,6 +40,7 @@ where
             max_steps,
             require_citations: false,
             shortlist_limit: 0,
+            verify_answer_content: true,
         }
     }
 
@@ -54,6 +56,14 @@ where
     #[must_use]
     pub fn with_shortlist_limit(mut self, limit: u8) -> Self {
         self.shortlist_limit = limit;
+        self
+    }
+
+    /// Quando `true` (padrão), exige que a resposta final contenha o valor real (`object`)
+    /// dos fatos citados ou o resultado do `EvalMath`, bloqueando respostas degeneradas (ex.: `"O"`).
+    #[must_use]
+    pub fn with_verify_answer_content(mut self, enabled: bool) -> Self {
+        self.verify_answer_content = enabled;
         self
     }
 
@@ -87,6 +97,8 @@ where
 
         let mut history = Vec::with_capacity(8);
         let mut session_facts: HashSet<FactId> = HashSet::new();
+        let mut session_fact_records: HashMap<FactId, Fact> = HashMap::new();
+        let mut last_math_value: Option<String> = None;
         let mut audit = AuditTrail::default();
 
         if !doc.is_empty() {
@@ -108,6 +120,7 @@ where
 
                 for fact in &candidates {
                     session_facts.insert(fact.id.clone());
+                    session_fact_records.insert(fact.id.clone(), fact.clone());
                     candidate_ids.push(fact.id.clone());
                     payload.push(json!({
                         "id": fact.id.as_str(),
@@ -142,6 +155,7 @@ where
                     let payload = match &fact {
                         Some(found) => {
                             session_facts.insert(found.id.clone());
+                            session_fact_records.insert(found.id.clone(), found.clone());
                             audit.record(
                                 step_index,
                                 snapshot,
@@ -180,6 +194,7 @@ where
                     let facts = self.memory.traverse(&start_entity, max_hops).await?;
                     for fact in &facts {
                         session_facts.insert(fact.id.clone());
+                        session_fact_records.insert(fact.id.clone(), fact.clone());
                     }
                     audit.record(
                         step_index,
@@ -198,6 +213,7 @@ where
                 {
                     Ok(value) => {
                         let value_str = value.to_string();
+                        last_math_value = Some(value_str.clone());
                         audit.record(
                             step_index,
                             snapshot,
@@ -320,46 +336,90 @@ where
                         continue;
                     }
 
-                    let draft = CandidateAnswer::draft(text, cited_facts);
-                    match draft.verify_citations(&session_facts) {
-                        Ok(verified) => {
-                            audit.record(
-                                step_index,
-                                snapshot,
-                                action,
-                                AuditOutcome::AnswerVerified,
-                            );
-                            return Ok(VerifiedOutcome::new(verified, audit));
-                        }
-                        Err(VerificationError::UncitedOrHallucinatedFacts { missing }) => {
-                            repair_attempts = repair_attempts.saturating_add(1);
-                            let missing_list: Vec<&str> =
-                                missing.iter().map(FactId::as_str).collect();
-                            tracing::warn!(
-                                step_index,
-                                ?missing_list,
-                                "blocked answer citing unretrieved or hallucinated facts"
-                            );
-                            audit.record(
-                                step_index,
-                                snapshot,
-                                action,
-                                AuditOutcome::CitationRejected {
-                                    missing: missing.clone(),
-                                },
-                            );
-                            history.push(Message::system(format!(
-                                "REPAIR REQUIRED (hallucinated facts): os IDs {:?} não foram recuperados da memória determinística nesta sessão. Consulte via QueryFact ou TraverseGraph antes de responder.",
-                                missing_list
-                            )));
-                        }
+                    // 1. Verifica primeiro se todos os FactIds citados foram realmente recuperados.
+                    let citation_check =
+                        CandidateAnswer::draft(text.clone(), cited_facts.clone())
+                            .verify_citations(&session_facts);
+                    if let Err(VerificationError::UncitedOrHallucinatedFacts { missing }) =
+                        citation_check
+                    {
+                        repair_attempts = repair_attempts.saturating_add(1);
+                        let missing_list: Vec<&str> =
+                            missing.iter().map(FactId::as_str).collect();
+                        tracing::warn!(
+                            step_index,
+                            ?missing_list,
+                            "blocked answer citing unretrieved or hallucinated facts"
+                        );
+                        audit.record(
+                            step_index,
+                            snapshot,
+                            action,
+                            AuditOutcome::CitationRejected {
+                                missing: missing.clone(),
+                            },
+                        );
+                        history.push(Message::system(format!(
+                            "REPAIR REQUIRED (hallucinated facts): os IDs {:?} não foram recuperados da memória determinística nesta sessão. Consulte via QueryFact ou TraverseGraph antes de responder.",
+                            missing_list
+                        )));
+                        continue;
                     }
+
+                    // 2. Expande slots/templates determinísticos (permite <ANSWER> sem chamar a head 65k).
+                    let rendered_text = render_slot_template(
+                        &text,
+                        &cited_facts,
+                        &session_fact_records,
+                        last_math_value.as_deref(),
+                    );
+
+                    // 3. Fecha o buraco de conteúdo: garante valor do fato citado / EvalMath no texto.
+                    if self.verify_answer_content
+                        && let Err(reason) = verify_answer_grounding(
+                            &rendered_text,
+                            &cited_facts,
+                            &session_fact_records,
+                            last_math_value.as_deref(),
+                        )
+                    {
+                        repair_attempts = repair_attempts.saturating_add(1);
+                        tracing::warn!(
+                            step_index,
+                            %reason,
+                            "blocked answer missing grounded fact object or math value"
+                        );
+                        audit.record(
+                            step_index,
+                            snapshot,
+                            action,
+                            AuditOutcome::AnswerContentRejected {
+                                reason: reason.clone(),
+                            },
+                        );
+                        history.push(Message::system(format!(
+                            "REPAIR REQUIRED (content): {reason}. Inclua o valor exato retornado ou use \"@slot\" com os FactIds citados."
+                        )));
+                        continue;
+                    }
+
+                    let verified = CandidateAnswer::draft(rendered_text, cited_facts)
+                        .verify_citations(&session_facts)
+                        .map_err(|_| EngineError::EmptyPrompt)?;
+                    audit.record(
+                        step_index,
+                        snapshot,
+                        action,
+                        AuditOutcome::AnswerVerified,
+                    );
+                    return Ok(VerifiedOutcome::new(verified, audit));
                 }
 
                 LlmAction::SearchFacts { query, limit } => {
                     let facts = self.memory.search_facts(&query, limit).await?;
                     for fact in &facts {
                         session_facts.insert(fact.id.clone());
+                        session_fact_records.insert(fact.id.clone(), fact.clone());
                     }
                     audit.record(
                         step_index,
@@ -463,6 +523,157 @@ where
             max_steps: self.max_steps,
             repair_attempts,
         })
+    }
+}
+
+/// Expande templates determinísticos sem precisar gerar texto livre na `head` de 65k:
+/// - `""` ou `"@slot"` -> materializa frase exata a partir dos fatos citados e/ou `EvalMath`.
+/// - Placeholders `{{subject}}`, `{{relation}}`, `{{object}}`, `{{id}}`, `{{math}}` -> substituídos.
+fn render_slot_template(
+    raw_text: &str,
+    cited_facts: &[FactId],
+    records: &HashMap<FactId, Fact>,
+    last_math_value: Option<&str>,
+) -> String {
+    let trimmed = raw_text.trim();
+    let cited_records: Vec<&Fact> = cited_facts
+        .iter()
+        .filter_map(|id| records.get(id))
+        .collect();
+
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("@slot") {
+        return match (last_math_value, cited_records.as_slice()) {
+            (Some(math_val), [fact]) => format!(
+                "O resultado exato é {math_val} (baseado em {} de {} = {}).",
+                fact.relation, fact.subject, fact.object
+            ),
+            (Some(math_val), _) => format!("O resultado exato é {math_val}."),
+            (None, [fact]) => format!(
+                "O valor de {} de {} é {}.",
+                fact.relation, fact.subject, fact.object
+            ),
+            (None, many) if !many.is_empty() => {
+                let items: Vec<String> = many
+                    .iter()
+                    .map(|f| format!("{} ({}) = {}", f.subject, f.relation, f.object))
+                    .collect();
+                format!("Fatos verificados: {}.", items.join("; "))
+            }
+            (None, _) => trimmed.to_owned(),
+        };
+    }
+
+    if !raw_text.contains("{{") {
+        return raw_text.to_owned();
+    }
+
+    let mut out = raw_text.to_owned();
+    if let Some(math_val) = last_math_value {
+        out = out.replace("{{math}}", math_val);
+    }
+    if let Some(first) = cited_records.first() {
+        out = out
+            .replace("{{id}}", first.id.as_str())
+            .replace("{{subject}}", &first.subject)
+            .replace("{{relation}}", &first.relation)
+            .replace("{{object}}", &first.object);
+    }
+    out
+}
+
+/// Garante que a resposta não é vazia/degenerada e contém os valores verificados da sessão.
+fn verify_answer_grounding(
+    text: &str,
+    cited_facts: &[FactId],
+    records: &HashMap<FactId, Fact>,
+    last_math_value: Option<&str>,
+) -> Result<(), String> {
+    let trimmed = text.trim();
+    if trimmed.chars().count() < 2 {
+        return Err(format!(
+            "resposta vazia ou curta demais ('{trimmed}')"
+        ));
+    }
+
+    if let Some(math_val) = last_math_value
+        && !contains_value_normalized(trimmed, math_val)
+    {
+        return Err(format!(
+            "a resposta não contém o resultado exato '{math_val}' calculado pelo EvalMath"
+        ));
+    }
+
+    let cited_objects: Vec<&str> = cited_facts
+        .iter()
+        .filter_map(|id| records.get(id))
+        .map(|fact| fact.object.trim())
+        .filter(|obj| !obj.is_empty())
+        .collect();
+
+    // Quando não houve EvalMath, ao menos um valor `object` dos fatos citados precisa estar presente.
+    if last_math_value.is_none()
+        && !cited_objects.is_empty()
+        && !cited_objects
+            .iter()
+            .any(|obj| contains_value_normalized(trimmed, obj))
+    {
+        return Err(format!(
+            "a resposta não menciona o valor verificado ({:?}) dos fatos citados",
+            cited_objects
+        ));
+    }
+
+    Ok(())
+}
+
+fn contains_value_normalized(text: &str, expected: &str) -> bool {
+    let expected_trimmed = expected.trim();
+    if expected_trimmed.is_empty() {
+        return true;
+    }
+
+    let text_lower = text.to_lowercase();
+    let exp_lower = expected_trimmed.to_lowercase();
+
+    if text_lower.contains(&exp_lower) {
+        return true;
+    }
+
+    let exp_comma = exp_lower.replace('.', ",");
+    if text_lower.contains(&exp_comma) {
+        return true;
+    }
+
+    if let Some(compact_num) = strip_trailing_decimal_zeros(&exp_lower)
+        && (text_lower.contains(&compact_num)
+            || text_lower.contains(&compact_num.replace('.', ",")))
+    {
+        return true;
+    }
+
+    if exp_lower.contains('_') && text_lower.contains(&exp_lower.replace('_', " ")) {
+        return true;
+    }
+
+    false
+}
+
+fn strip_trailing_decimal_zeros(num: &str) -> Option<String> {
+    let (int_part, frac_part) = num.split_once('.')?;
+    let int_digits = int_part.strip_prefix('-').unwrap_or(int_part);
+    if int_digits.is_empty()
+        || !int_digits.chars().all(|c| c.is_ascii_digit())
+        || !frac_part.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let trimmed_frac = frac_part.trim_end_matches('0');
+    if trimmed_frac.is_empty() {
+        Some(int_part.to_owned())
+    } else if trimmed_frac.len() < frac_part.len() {
+        Some(format!("{int_part}.{trimmed_frac}"))
+    } else {
+        None
     }
 }
 
