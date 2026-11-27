@@ -1,4 +1,4 @@
-use llguidance::toktrie::{SimpleVob, TokenId};
+use llguidance::toktrie::TokenId;
 pub use ns_kernels::{Q4_BLOCK_SIZE, active_q4_backend};
 use ns_kernels::{
     Q4Block, compute_q4_row_range, compute_q4_row_range_x4, dot_q4_row, f16_to_f32, f32_to_f16,

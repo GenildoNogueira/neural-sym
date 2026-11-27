@@ -1,115 +1,228 @@
-use std::time::Instant;
+//! cargo run --release -p ns-llm --features custom-rwkv --example matmul4_bench
+//!
+//! Micro-matmul `M x 4` (`matmul4_into`, pesos lidos 1x) contra 4x matvec `M x 1`.
+//!
+//! - Verifica a **equivalência numérica** (matmul4 × 4 matvec) e sai com erro se divergir além de
+//!   `NS_BENCH_TOL` (padrão 1e-3, relativo ao maior módulo da saída).
+//! - Mede A/B intercalado, mediana de `NS_BENCH_SAMPLES` amostras, nos modos `quente` (mesma
+//!   matriz, cache) e `stream` (pool de cópias > L3, como no decode real).
+//! - `NS_BENCH_SKIP_15B=1` pula as formas do 1.5B (a head 65536x2048 exige ~0,6 GiB de RAM).
+
+use std::process::ExitCode;
 
 use ns_llm::quant::{QuantFormat, QuantizedMatrix, active_q4_backend};
 
-fn bench_pair(
-    label: &str,
+#[path = "common/mod.rs"]
+mod common;
+
+#[derive(Clone, Copy)]
+struct Shape {
+    label: &'static str,
     out_dim: usize,
     in_dim: usize,
     format: QuantFormat,
     iters: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut weights = vec![0.0_f32; out_dim * in_dim];
-    for r in 0..out_dim {
-        let base = r * in_dim;
-        for c in 0..in_dim {
-            weights[base + c] = (((r * 19 + c * 7) % 61) as f32 - 30.0) * 0.015;
-        }
-    }
-    let xs: Vec<Vec<f32>> = (0..4)
-        .map(|k| {
-            (0..in_dim)
-                .map(|i| ((i as f32) * (0.17 + k as f32 * 0.03)).sin())
-                .collect()
-        })
-        .collect();
-
-    let mat = QuantizedMatrix::from_f32_with_format(&weights, out_dim, in_dim, format)?;
-
-    let mut q0 = vec![0_i8; in_dim];
-    let mut q1 = vec![0_i8; in_dim];
-    let mut q2 = vec![0_i8; in_dim];
-    let mut q3 = vec![0_i8; in_dim];
-    let mut o0 = vec![0.0_f32; out_dim];
-    let mut o1 = vec![0.0_f32; out_dim];
-    let mut o2 = vec![0.0_f32; out_dim];
-    let mut o3 = vec![0.0_f32; out_dim];
-
-    // Warmup
-    for _ in 0..3 {
-        mat.matvec_into(&xs[0], &mut q0, &mut o0);
-        mat.matmul4_into(
-            [&xs[0], &xs[1], &xs[2], &xs[3]],
-            [&mut q0, &mut q1, &mut q2, &mut q3],
-            [&mut o0, &mut o1, &mut o2, &mut o3],
-        );
-    }
-
-    // 4 chamadas independentes de matvec (lê pesos 4x da RAM)
-    let t0 = Instant::now();
-    for _ in 0..iters {
-        mat.matvec_into(&xs[0], &mut q0, &mut o0);
-        mat.matvec_into(&xs[1], &mut q1, &mut o1);
-        mat.matvec_into(&xs[2], &mut q2, &mut o2);
-        mat.matvec_into(&xs[3], &mut q3, &mut o3);
-    }
-    let four_matvec_ms = (t0.elapsed().as_secs_f64() * 1_000.0) / (iters as f64);
-
-    // 1 chamada micro-matmul M x 4 (lê pesos 1x da RAM)
-    let t1 = Instant::now();
-    for _ in 0..iters {
-        mat.matmul4_into(
-            [&xs[0], &xs[1], &xs[2], &xs[3]],
-            [&mut q0, &mut q1, &mut q2, &mut q3],
-            [&mut o0, &mut o1, &mut o2, &mut o3],
-        );
-    }
-    let matmul4_ms = (t1.elapsed().as_secs_f64() * 1_000.0) / (iters as f64);
-
-    let ram_mib = (mat.weight_bytes() as f64) / (1024.0 * 1024.0);
-    let speedup = four_matvec_ms / matmul4_ms;
-    let per_branch_ms = matmul4_ms / 4.0;
-
-    std::hint::black_box((&o0, &o1, &o2, &o3));
-    println!(
-        "{:<26} | {:<2} | {:>6.2} MiB | {:>7.3} ms | {:>7.3} ms | {:>6.3} ms | {:>5.2}x",
-        label,
-        match format {
-            QuantFormat::W8 => "W8",
-            QuantFormat::Q4 => "Q4",
-        },
-        ram_mib,
-        four_matvec_ms,
-        matmul4_ms,
-        per_branch_ms,
-        speedup
-    );
-    Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn fmt_name(format: QuantFormat) -> &'static str {
+    match format {
+        QuantFormat::W8 => "W8",
+        QuantFormat::Q4 => "Q4",
+    }
+}
+
+/// Devolve `true` se a equivalência numérica passou.
+fn bench_pair(shape: &Shape, tol: f64) -> Result<bool, Box<dyn std::error::Error>> {
+    let Shape {
+        label,
+        out_dim,
+        in_dim,
+        format,
+        iters,
+    } = *shape;
+
+    let weights = common::fill_weights(out_dim, in_dim, 0x5eed_1000 ^ (out_dim as u64));
+    let xs: Vec<Vec<f32>> = (0..4)
+        .map(|k| common::fill_input(in_dim, 0x5eed_2000 + k))
+        .collect();
+
+    let first = QuantizedMatrix::from_f32_with_format(&weights, out_dim, in_dim, format)?;
+    drop(weights);
+    let bytes = first.weight_bytes();
+    let n = common::pool_len(bytes);
+    let mut pool: Vec<QuantizedMatrix> = (1..n).map(|_| first.clone()).collect();
+    pool.push(first);
+
+    let mut q = [
+        vec![0_i8; in_dim],
+        vec![0_i8; in_dim],
+        vec![0_i8; in_dim],
+        vec![0_i8; in_dim],
+    ];
+    let mut o = [
+        vec![0.0_f32; out_dim],
+        vec![0.0_f32; out_dim],
+        vec![0.0_f32; out_dim],
+        vec![0.0_f32; out_dim],
+    ];
+    let mut q_seq = vec![0_i8; in_dim];
+    let mut o_seq = [
+        vec![0.0_f32; out_dim],
+        vec![0.0_f32; out_dim],
+        vec![0.0_f32; out_dim],
+        vec![0.0_f32; out_dim],
+    ];
+
+    // Equivalência: 4x matvec vs 1x matmul4 (mesmas entradas).
+    for k in 0..4 {
+        pool[0].matvec_into(&xs[k], &mut q_seq, &mut o_seq[k]);
+    }
+    {
+        let [q0, q1, q2, q3] = &mut q;
+        let [o0, o1, o2, o3] = &mut o;
+        pool[0].matmul4_into(
+            [&xs[0], &xs[1], &xs[2], &xs[3]],
+            [q0, q1, q2, q3],
+            [o0, o1, o2, o3],
+        );
+    }
+    let diff = (0..4)
+        .map(|k| common::max_rel_diff(&o_seq[k], &o[k]))
+        .fold(0.0_f64, f64::max);
+    let ok = diff <= tol;
+
+    for (mode, hot) in [("quente", true), ("stream", false)] {
+        let (four_ms, m4_ms) = common::time_ab_ms(
+            iters,
+            |i| {
+                let m = if hot { &pool[0] } else { &pool[i % pool.len()] };
+                for k in 0..4 {
+                    m.matvec_into(
+                        std::hint::black_box(&xs[k]),
+                        &mut q_seq,
+                        std::hint::black_box(&mut o_seq[k]),
+                    );
+                }
+            },
+            |i| {
+                let m = if hot { &pool[0] } else { &pool[i % pool.len()] };
+                let [q0, q1, q2, q3] = &mut q;
+                let [o0, o1, o2, o3] = &mut o;
+                m.matmul4_into(
+                    [&xs[0], &xs[1], &xs[2], &xs[3]],
+                    [q0, q1, q2, q3],
+                    [o0, o1, o2, o3],
+                );
+            },
+        );
+        println!(
+            "{:<24} | {:<2} | {:<6} | {:>7.2} | {:>8.3} | {:>8.3} | {:>7.3} | {:>5.2}x | {:>9.2e}{}",
+            label,
+            fmt_name(format),
+            mode,
+            common::mib(bytes),
+            four_ms,
+            m4_ms,
+            m4_ms / 4.0,
+            four_ms / m4_ms,
+            diff,
+            if ok { "" } else { "  <-- DIVERGE" },
+        );
+    }
+
+    std::hint::black_box((&o, &o_seq));
+    Ok(ok)
+}
+
+fn main() -> ExitCode {
+    let tol = std::env::var("NS_BENCH_TOL")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(1e-3);
+
     println!();
+    println!("Micro-Matmul (M x 4) vs 4x Matvec (M x 1) | equivalência: tol {tol:e}");
+    common::print_env(active_q4_backend());
     println!(
-        "Micro-Matmul (M x 4) vs 4x Matvec (M x 1) | backend Q4: {}",
-        active_q4_backend()
+        "{:<24} | Q  | {:<6} | {:>7} | {:>8} | {:>8} | {:>7} | {:>6} | {:>9}",
+        "Matriz", "modo", "MiB", "4x matvec", "1x mm4", "ms/ramo", "Ganho", "dif. rel."
     );
-    println!(
-        "{:<26} | Q  | {:>10} | {:>10} | {:>10} | {:>9} | Ganho",
-        "Matriz (0.1B e 1.5B)", "RAM", "4x matvec", "1x matmul4", "ms/ramo"
-    );
-    println!("{}", "-".repeat(92));
+    println!("{}", "-".repeat(104));
 
-    // Perfis RWKV-7 0.1B (d=768)
-    bench_pair("0.1B cm.key (3072x768)", 3072, 768, QuantFormat::Q4, 100)?;
-    bench_pair("0.1B head (65536x768)", 65536, 768, QuantFormat::W8, 20)?;
-    bench_pair("0.1B head (65536x768)", 65536, 768, QuantFormat::Q4, 20)?;
-    println!("{}", "-".repeat(92));
+    let mut shapes = vec![
+        Shape {
+            label: "0.1B cm.key (3072x768)",
+            out_dim: 3072,
+            in_dim: 768,
+            format: QuantFormat::Q4,
+            iters: 100,
+        },
+        Shape {
+            label: "0.1B head (65536x768)",
+            out_dim: 65536,
+            in_dim: 768,
+            format: QuantFormat::W8,
+            iters: 12,
+        },
+        Shape {
+            label: "0.1B head (65536x768)",
+            out_dim: 65536,
+            in_dim: 768,
+            format: QuantFormat::Q4,
+            iters: 12,
+        },
+    ];
+    if !common::env_flag("NS_BENCH_SKIP_15B") {
+        shapes.extend([
+            Shape {
+                label: "1.5B tm.proj (2048x2048)",
+                out_dim: 2048,
+                in_dim: 2048,
+                format: QuantFormat::Q4,
+                iters: 80,
+            },
+            Shape {
+                label: "1.5B cm.key (7168x2048)",
+                out_dim: 7168,
+                in_dim: 2048,
+                format: QuantFormat::Q4,
+                iters: 40,
+            },
+            Shape {
+                label: "1.5B head (65536x2048)",
+                out_dim: 65536,
+                in_dim: 2048,
+                format: QuantFormat::W8,
+                iters: 6,
+            },
+            Shape {
+                label: "1.5B head (65536x2048)",
+                out_dim: 65536,
+                in_dim: 2048,
+                format: QuantFormat::Q4,
+                iters: 6,
+            },
+        ]);
+    }
 
-    // Perfis RWKV-7 1.5B (d=2048, ffn=7168)
-    bench_pair("1.5B tm.proj (2048x2048)", 2048, 2048, QuantFormat::Q4, 80)?;
-    bench_pair("1.5B cm.key (7168x2048)", 7168, 2048, QuantFormat::Q4, 40)?;
-    bench_pair("1.5B head (65536x2048)", 65536, 2048, QuantFormat::W8, 10)?;
-    bench_pair("1.5B head (65536x2048)", 65536, 2048, QuantFormat::Q4, 10)?;
+    let mut all_ok = true;
+    for (idx, shape) in shapes.iter().enumerate() {
+        if idx == 3 {
+            println!("{}", "-".repeat(104));
+        }
+        match bench_pair(shape, tol) {
+            Ok(ok) => all_ok &= ok,
+            Err(err) => {
+                eprintln!("erro em {}: {err}", shape.label);
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
-    Ok(())
+    if all_ok {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("matmul4 divergiu de 4x matvec acima da tolerância");
+        ExitCode::FAILURE
+    }
 }
